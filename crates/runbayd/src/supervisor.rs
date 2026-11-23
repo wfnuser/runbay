@@ -1,4 +1,4 @@
-use crate::adapters::{AdapterLaunchContext, AdapterRegistry};
+use crate::adapters::{AdapterLaunchContext, AdapterRegistry, NativeOutcome};
 use crate::auth::{
     generate_csprng_token, validate_identifier, validate_workspace_dir, MAX_PROMPT_BYTES,
     MAX_TIMEOUT_SECS,
@@ -838,15 +838,29 @@ impl DaemonSupervisor {
         );
 
         // 5. Stream stdout & stderr concurrently through GuardedRunSink.
+        let native_outcome = Arc::new(Mutex::new(None::<NativeOutcome>));
         let stdout_handle = sandboxed.child.stdout.take().map(|stdout| {
             let sup = Arc::clone(&self);
             let sink_c = Arc::clone(&sink);
             let active_c = Arc::clone(&active);
             let rid = run.run_id.clone();
             let aid = run.agent_id.clone();
+            let runtime = run.runtime.clone();
+            let outcome = Arc::clone(&native_outcome);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    // Native final events contain cumulative text and can exceed the display cap.
+                    // Inspect the original JSON before truncating what we persist/emit.
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(result) = sup
+                            .adapters
+                            .get(&runtime)
+                            .and_then(|a| a.output_outcome(&parsed))
+                        {
+                            *outcome.lock() = Some(result);
+                        }
+                    }
                     let bounded: String = line.chars().take(MAX_EVENT_LINE_BYTES).collect();
                     let (ev_type, payload) =
                         match serde_json::from_str::<serde_json::Value>(&bounded) {
@@ -920,7 +934,26 @@ impl DaemonSupervisor {
                     let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
                 }
                 let code = status.code();
-                if status.success() {
+                let reported_failure = match native_outcome.lock().clone() {
+                    Some(NativeOutcome::Failed(reason)) => Some(reason),
+                    None if self
+                        .adapters
+                        .get(&run.runtime)
+                        .is_some_and(|a| a.requires_completion_event()) =>
+                    {
+                        Some("CLI exited without a native completion event".into())
+                    }
+                    _ => None,
+                };
+                if status.success() && reported_failure.is_some() {
+                    mvcc.abort_branch(&branch.branch_id, "runtime_reported_error");
+                    (
+                        RunState::Failed,
+                        code,
+                        Some("runtime_reported_error".to_string()),
+                        reported_failure,
+                    )
+                } else if status.success() {
                     (RunState::Succeeded, code, None, None)
                 } else {
                     mvcc.abort_branch(&branch.branch_id, "nonzero_exit");

@@ -91,6 +91,7 @@ pub fn resolve_allowed_upstream_url(
         "/v1/chat/completions" => "/chat/completions",
         "/v1/responses" => "/responses",
         "/v1/embeddings" => "/embeddings",
+        "/v1/messages" => "/messages",
         _ => return None,
     };
 
@@ -133,8 +134,9 @@ impl SecretlessLoopbackGateway {
         let addr: SocketAddr = listener.local_addr()?;
         let port = addr.port();
 
-        let mut client_builder =
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(45));
+        let mut client_builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(45))
+            .redirect(reqwest::redirect::Policy::none());
         if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
             client_builder = client_builder.no_proxy();
         }
@@ -334,7 +336,12 @@ async fn handle_request(
         );
     };
 
-    // 2. Authenticate opaque bearer token
+    let anthropic = req.uri().path() == "/v1/messages";
+    let chat_completions = req.uri().path() == "/v1/chat/completions";
+    let anthropic_version = req.headers().get("anthropic-version").cloned();
+    let anthropic_beta = req.headers().get("anthropic-beta").cloned();
+
+    // 2. Authenticate the opaque token; Anthropic SDKs normally use x-api-key.
     let auth = req
         .headers()
         .get("authorization")
@@ -343,6 +350,11 @@ async fn handle_request(
     let bearer = auth
         .strip_prefix("Bearer ")
         .map(str::trim)
+        .or_else(|| {
+            anthropic
+                .then(|| req.headers().get("x-api-key")?.to_str().ok())
+                .flatten()
+        })
         .unwrap_or("")
         .to_string();
 
@@ -429,7 +441,7 @@ async fn handle_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if is_stream && req_json.get("stream_options").is_none() {
+    if is_stream && chat_completions && req_json.get("stream_options").is_none() {
         if let Some(obj) = req_json.as_object_mut() {
             obj.insert(
                 "stream_options".to_string(),
@@ -444,7 +456,7 @@ async fn handle_request(
     let token_prefix: String = bearer.chars().take(16).collect();
 
     // 5. Dispatch upstream request while watching for immediate revocation
-    let send_fut = state
+    let mut upstream_request = state
         .client
         .post(upstream_url)
         .header("Authorization", format!("Bearer {}", state.real_api_key))
@@ -457,8 +469,19 @@ async fn handle_request(
                 "application/json"
             },
         )
-        .body(forward_body)
-        .send();
+        .body(forward_body);
+    if anthropic {
+        upstream_request = upstream_request
+            .header("x-api-key", &state.real_api_key)
+            .header(
+                "anthropic-version",
+                anthropic_version.unwrap_or_else(|| http::HeaderValue::from_static("2023-06-01")),
+            );
+        if let Some(beta) = anthropic_beta {
+            upstream_request = upstream_request.header("anthropic-beta", beta);
+        }
+    }
+    let send_fut = upstream_request.send();
 
     let up_resp = tokio::select! {
         biased;
@@ -903,6 +926,128 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_gateway_never_follows_credential_bearing_redirects() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}/v1", source.local_addr().unwrap());
+        let location = format!("http://{}/stolen", target.local_addr().unwrap());
+        let target_task = tokio::spawn(async move {
+            let (stream, _) = target.accept().await.unwrap();
+            let svc = service_fn(|_: Request<Incoming>| async {
+                Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), svc)
+                .await;
+        });
+        let source_task = tokio::spawn(async move {
+            let (stream, _) = source.accept().await.unwrap();
+            let svc = service_fn(move |_: Request<Incoming>| {
+                let location = location.clone();
+                async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(307)
+                            .header("location", location)
+                            .body(Full::new(Bytes::from_static(b"{}")))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), svc)
+                .await;
+        });
+        let gateway = SecretlessLoopbackGateway::start(upstream, "host-only-key", None)
+            .await
+            .unwrap();
+        let token = gateway.mint_run_token("redirect", None);
+        let response = reqwest::Client::new()
+            .post(format!("{}/messages", gateway.base_url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"model":"test","stream":false}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        source_task.abort();
+        target_task.abort();
+        assert_eq!(
+            status, 307,
+            "gateway must not forward host credentials to a redirect target"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_messages_preserve_protocol_and_replace_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}/anthropic/v1", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let seen_tx = Arc::new(Mutex::new(Some(seen_tx)));
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let tx = Arc::clone(&seen_tx);
+                async move {
+                    let path = req.uri().path().to_string();
+                    let headers = req.headers().clone();
+                    let bytes = req.into_body().collect().await.unwrap().to_bytes();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    tx.lock()
+                        .take()
+                        .unwrap()
+                        .send((path, headers, body))
+                        .unwrap();
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(Full::new(Bytes::from_static(
+                                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                            )))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let gateway = SecretlessLoopbackGateway::start(upstream, "host-only-key", None)
+            .await
+            .unwrap();
+        let token = gateway.mint_run_token("anthropic", Some("test-model".into()));
+        let client = reqwest::Client::new();
+        let response = client.post(format!("{}/messages", gateway.base_url()))
+            .header("x-api-key", &token)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .json(&serde_json::json!({"model":"test-model","stream":true,"max_tokens":32,"messages":[{"role":"user","content":"hi"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("message_stop"));
+        let (path, headers, body) = seen_rx.await.unwrap();
+        assert_eq!(path, "/anthropic/v1/messages");
+        assert_eq!(headers["x-api-key"], "host-only-key");
+        assert_eq!(headers["authorization"], "Bearer host-only-key");
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+        assert_eq!(headers["anthropic-beta"], "prompt-caching-2024-07-31");
+        assert!(
+            body.get("stream_options").is_none(),
+            "OpenAI fields must not corrupt Anthropic requests"
+        );
+        gateway.revoke_run_token(&token);
+        let revoked = client
+            .post(format!("{}/messages", gateway.base_url()))
+            .header("x-api-key", &token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), 401);
+        server.abort();
+    }
 
     #[test]
     fn test_route_allowlist_blocks_authority_confusion() {
