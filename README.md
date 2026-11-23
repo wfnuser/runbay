@@ -98,7 +98,7 @@ claude --version
 pi --version
 ```
 
-Verified CLI versions: Claude Code **2.1.296**, Pi **1.6.0**. Older CLIs may not support the isolation flags used here. The deprecated `@mariozechner/pi-coding-agent` package is not the tested target.
+Verified live-run CLI versions: Claude Code **2.1.239**, Pi **1.6.0**. Older CLIs may not support the isolation flags used here. The deprecated `@mariozechner/pi-coding-agent` package is not the tested target. Check `/v1/status` for the exact executable selected by the daemon's PATH, which may differ from an interactive shell.
 
 Runbay discovers the executables on its host PATH. Optional `RUNBAY_CLAUDE_BIN` and `RUNBAY_PI_BIN` environment variables select explicit executables; an invalid override fails instead of silently choosing another installation. npm scripts are launched with the host's absolute Node executable so the sandbox's minimal PATH works with nvm installs.
 

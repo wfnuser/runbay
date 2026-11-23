@@ -5,7 +5,7 @@ Baseline: `main@362b4a00b49ff0e7005f76f9a78dbf5c34c93aad`.
 
 ## Installed clients
 
-- Claude Code 2.1.296.
+- Claude Code 2.1.239, verified from the live run's `system/init.claude_code_version` event. The host also has a 2.1.296 shell installation, but that was not the executable selected by the daemon's PATH for the live smoke test.
 - Pi 1.6.0 from `@earendil-works/pi-coding-agent`.
 - No host login/configuration was imported into sandbox homes or committed.
 
