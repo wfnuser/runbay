@@ -67,6 +67,11 @@ pub struct ReconReport {
     pub hit_rate_diff: f64,
     pub diff_ci: (f64, f64),
     pub token_ratio_warm_p50: f64,
+    pub total_prompt_tokens: u64,
+    pub total_cached_tokens: u64,
+    pub cache_hit_token_ratio: f64,
+    pub drift_buckets: Vec<(f64, usize, f64)>,
+    pub drift_detected: bool,
     pub gap_buckets: Vec<(String, usize, f64, f64)>,
     pub est_service_residual: (f64, f64, f64),
     pub est_wait_residual: (f64, f64, f64),
@@ -174,11 +179,14 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
     let (mut n_warm, mut n_miss) = (0usize, 0usize);
     let mut diffs: Vec<f64> = Vec::new();
     let mut warm_token_ratios: Vec<f64> = Vec::new();
+    let mut total_prompt_tokens: u64 = 0;
+    let mut total_cached_tokens: u64 = 0;
     let mut service_res: Vec<f64> = Vec::new();
     let mut wait_res: Vec<f64> = Vec::new();
     let mut term_counts: HashMap<String, usize> = HashMap::new();
     // Per-cluster ordered rows for gap buckets: (cluster, ts, pred_warm, hit).
     let mut per_cluster: HashMap<String, Vec<(f64, bool, bool)>> = HashMap::new();
+    let mut time_series: Vec<(f64, bool, bool)> = Vec::new();
 
     for (run_id, d) in decisions.iter() {
         let Some(a) = actuals.get(run_id) else {
@@ -208,6 +216,8 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
                 (false, false) => q_mm += 1,
             }
             diffs.push(warm as i8 as f64 - a.hit as i8 as f64);
+            total_prompt_tokens += a.prompt_tokens;
+            total_cached_tokens += a.cached_tokens;
             if warm && a.prompt_tokens > 0 {
                 warm_token_ratios.push(a.cached_tokens as f64 / a.prompt_tokens as f64);
             }
@@ -225,6 +235,7 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
                 d.cluster.clone()
             };
             per_cluster.entry(key).or_default().push((d.ts, warm, a.hit));
+            time_series.push((d.ts, warm, a.hit));
         }
     }
     let n_orphan_decision = decisions.len() - n_joined;
@@ -248,6 +259,11 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
     let over_share = if n_warm > 0 { q_hm as f64 / n_warm as f64 } else { 0.0 };
     let over_wilson_upper = wilson_upper(q_hm, n_warm, 1.96);
     let token_ratio_warm_p50 = quantiles(warm_token_ratios.clone()).1;
+    let cache_hit_token_ratio = if total_prompt_tokens > 0 {
+        total_cached_tokens as f64 / total_prompt_tokens as f64
+    } else {
+        0.0
+    };
 
     // Gap buckets: within-cluster inter-arrival.
     let mut buckets: Vec<(String, usize, f64, f64)> = vec![
@@ -294,6 +310,46 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
         }
     }
 
+    // P4 TTL-drift change-point detection: split the exit-only runs into time
+    // epochs and track the overestimation share per epoch. A provider TTL
+    // semantics change surfaces as a sudden, persistent jump in the
+    // overestimation share (predicted-warm but actually-missed) in later epochs
+    // vs earlier ones — i.e. our 300s TTL assumption has gone stale.
+    let n_epochs = 5usize;
+    let mut drift_buckets: Vec<(f64, usize, f64)> = Vec::new();
+    let mut drift_detected = false;
+    if !time_series.is_empty() {
+        time_series.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let (t_min, t_max) = (time_series[0].0, time_series[time_series.len() - 1].0);
+        let span = (t_max - t_min).max(1e-6);
+        let mut prev_max_over = 0.0f64;
+        for e in 0..n_epochs {
+            let lo = t_min + span * e as f64 / n_epochs as f64;
+            let hi = t_min + span * (e + 1) as f64 / n_epochs as f64;
+            let mut n_warm = 0usize;
+            let mut n_over = 0usize;
+            for &(ts, warm, hit) in &time_series {
+                if ts >= lo && ts < hi {
+                    if warm {
+                        n_warm += 1;
+                        if !hit {
+                            n_over += 1;
+                        }
+                    }
+                }
+            }
+            let over_share = if n_warm > 0 { n_over as f64 / n_warm as f64 } else { 0.0 };
+            // Only compare epochs with a meaningful sample (>= 10 warm).
+            if e == n_epochs - 1 && n_warm >= 10 && over_share > prev_max_over + 0.15 {
+                drift_detected = true;
+            }
+            if n_warm >= 10 {
+                prev_max_over = prev_max_over.max(over_share);
+            }
+            drift_buckets.push((lo, n_warm, over_share));
+        }
+    }
+
     let est_service_residual = quantiles(service_res);
     let est_wait_residual = quantiles(wait_res);
     let mut terminations: Vec<(String, usize)> = term_counts.into_iter().collect();
@@ -326,7 +382,12 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
         hit_rate_diff,
         diff_ci,
         token_ratio_warm_p50,
+        total_prompt_tokens,
+        total_cached_tokens,
+        cache_hit_token_ratio,
         gap_buckets: buckets,
+        drift_buckets,
+        drift_detected,
         est_service_residual,
         est_wait_residual,
         terminations,
@@ -370,6 +431,13 @@ pub fn render_markdown(r: &ReconReport) -> String {
         r.diff_ci.1,
         pct(r.token_ratio_warm_p50)
     ));
+    md.push_str(&format!(
+        "- Cached-token savings (P4 DoD): {} cached / {} total input = {} (savings {})\n\n",
+        r.total_cached_tokens,
+        r.total_prompt_tokens,
+        pct(r.cache_hit_token_ratio),
+        if r.total_cached_tokens > 0 { "positive" } else { "zero" }
+    ));
 
     md.push_str("## 2. Per-cluster gap buckets (TTL drift readout)\n\n");
     md.push_str("| gap to prev run | n | actual hit rate | predicted-warm rate |\n|---|---|---|---|\n");
@@ -393,6 +461,19 @@ pub fn render_markdown(r: &ReconReport) -> String {
     for (t, n) in &r.terminations {
         md.push_str(&format!("- {t}: {n}\n"));
     }
+
+    md.push_str("## 5. TTL-drift change-point detection (P4)\n\n");
+    md.push_str(&format!(
+        "Drift flag: {}\n",
+        if r.drift_detected { "DETECTED — provider TTL semantics may have changed" } else { "none" }
+    ));
+    md.push_str("| epoch start | n warm | overestimation share |\n|---|---|---|\n");
+    for (lo, n, over) in &r.drift_buckets {
+        md.push_str(&format!("| {lo:.0} | {n} | {} |\n", pct(*over)));
+    }
+    md.push_str(
+        "\nA jump in the final epoch's overestimation share vs earlier epochs = the 300s TTL\nassumption went stale (provider changed cache TTL semantics); recalibrate `cache_ttl_s`.\n\n",
+    );
     md
 }
 
@@ -416,8 +497,15 @@ fn report_json(r: &ReconReport) -> Value {
         "hit_rate_diff": r.hit_rate_diff,
         "diff_ci": [r.diff_ci.0, r.diff_ci.1],
         "token_ratio_warm_p50": r.token_ratio_warm_p50,
+        "total_prompt_tokens": r.total_prompt_tokens,
+        "total_cached_tokens": r.total_cached_tokens,
+        "cache_hit_token_ratio": r.cache_hit_token_ratio,
         "gap_buckets": r.gap_buckets.iter().map(|(l, n, h, w)| {
             serde_json::json!({"bucket": l, "n": n, "actual_hit_rate": h, "pred_warm_rate": w})
+        }).collect::<Vec<_>>(),
+        "drift_detected": r.drift_detected,
+        "drift_buckets": r.drift_buckets.iter().map(|(lo, n, over)| {
+            serde_json::json!({"epoch_start": lo, "n_warm": n, "over_share": over})
         }).collect::<Vec<_>>(),
         "est_service_residual": {
             "mean": r.est_service_residual.0, "p50": r.est_service_residual.1, "p90": r.est_service_residual.2

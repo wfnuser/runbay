@@ -576,7 +576,7 @@ impl RuntimePoolScheduler {
         cap: f64,
         now: f64,
     ) -> ShadowDecision {
-        let est_service = self.cfg.est_service_s;
+        let est_service = self.est_service_now();
         let est_wait_pred = self.estimate_wait(depth);
         let rem_ttl_pred = self.cache.lock().rem_ttl(&meta.cluster_id, now);
         let window = self.cfg.rescue_window_s();
@@ -970,16 +970,55 @@ impl RuntimePoolScheduler {
         });
     }
 
+    /// L6: backfill `actual` rows for runs that were queued/deferred/running at
+    /// the previous shutdown. Their `decision` rows were already written at
+    /// submit; the process died before `finalize_run` could write the matching
+    /// `actual`, leaving orphan decisions in the reconciliation ledger. These
+    /// are infra interruptions (not scheduling starvation), so termination is
+    /// `failed` (== `termination_bucket("failed", Some("daemon_restarted"))`)
+    /// and bench_recon's A1 signal excludes them via the non-`exit` filter.
+    pub fn backfill_restart_actuals(&self, run_ids: &[String]) {
+        if run_ids.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        for run_id in run_ids {
+            self.ledger.log_actual(&ActualRow {
+                kind: "actual",
+                ts: now,
+                run_id: run_id.clone(),
+                tenant: String::new(),
+                cluster: String::new(),
+                queue_wait_actual: 0.0,
+                defer_wait_actual: None,
+                service_actual: 0.0,
+                total_ms_sum: 0.0,
+                cached_tokens_sum: 0,
+                prompt_tokens_sum: 0,
+                actual_hit: false,
+                termination: "failed".into(),
+            });
+        }
+    }
+
+    /// Rolling service-time estimate (P4): mean of recent completed runs
+    /// (start→end), falling back to the configured constant when no samples
+    /// have been observed yet. Replaces the constant `est_service_s` in the
+    /// budget check and defer-deadline arithmetic once enough runs finish.
+    fn est_service_now(&self) -> f64 {
+        let q = self.recent_service_s.lock();
+        if q.is_empty() {
+            self.cfg.est_service_s
+        } else {
+            q.iter().sum::<f64>() / q.len() as f64
+        }
+    }
+
     fn estimate_wait(&self, depth: QueueDepth) -> f64 {
-        let mean_service = {
-            let q = self.recent_service_s.lock();
-            if q.is_empty() {
-                self.cfg.est_service_s
-            } else {
-                q.iter().sum::<f64>() / q.len() as f64
-            }
-        };
-        mean_service * depth.queued as f64
+        self.est_service_now() * depth.queued as f64
     }
 
     /// P3c live metrics snapshot — **global aggregates only** (§4.6: a

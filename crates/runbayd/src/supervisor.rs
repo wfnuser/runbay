@@ -173,7 +173,7 @@ impl DaemonSupervisor {
             *parent = fs::canonicalize(&*parent)?;
             validate_cgroup_parent(parent)?;
         }
-        store.recover_interrupted_runs(|id| {
+        let recovered = store.recover_interrupted_runs(|id| {
             if let Some(parent) = &cfg.cgroup_root {
                 clean_interrupted_cgroup(parent, id)?;
             }
@@ -189,6 +189,9 @@ impl DaemonSupervisor {
             ..Default::default()
         };
         let runtime_pool = RuntimePoolScheduler::open(&state_dir, pool_cfg)?;
+        // L6: backfill `actual` rows for runs interrupted by the previous
+        // shutdown so the decision ledger has no orphan decisions.
+        runtime_pool.backfill_restart_actuals(&recovered);
 
         let adapters = AdapterRegistry::build(cfg.enable_fixture_adapter, cfg.codex_bin.clone())?;
 
