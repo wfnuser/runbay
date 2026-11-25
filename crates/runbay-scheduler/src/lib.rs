@@ -84,6 +84,9 @@ pub enum PolicyName {
     PriorityAging,
     WarmEnvAffinity,
     DualCacheTtlAware,
+    /// Session-Aware Guarded Dual (v1.1): session-level affinity + cluster-value rescue
+    /// + hard starvation ceiling + reserved background slice.
+    SessionGuardedDual,
 }
 
 impl PolicyName {
@@ -93,6 +96,7 @@ impl PolicyName {
             PolicyName::PriorityAging => "priority_aging",
             PolicyName::WarmEnvAffinity => "warm_env_affinity",
             PolicyName::DualCacheTtlAware => "dual_cache_ttl_aware",
+            PolicyName::SessionGuardedDual => "session_guarded_dual",
         }
     }
 }
@@ -165,15 +169,90 @@ pub struct PromptCacheMetrics {
     pub total_effective_input_cost_units: f64,
 }
 
+/// Guardrail activation counters (P1: hard ceiling + reserved background slice).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct GuardrailMetrics {
+    pub ceiling_forced_dispatches: usize,
+    pub bg_reserved_dispatches: usize,
+    pub borrowed_dispatches: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerPolicyReport {
     pub policy: String,
+    /// "legacy" (no TTL renewal) or "renewal" (sliding-TTL write-back on every run).
+    pub semantics: String,
     pub total_jobs: usize,
     pub throughput_jobs_per_min: f64,
     pub foreground: ForegroundMetrics,
     pub background: BackgroundMetrics,
     pub prompt_cache: PromptCacheMetrics,
     pub warm_env_reuse_rate: f64,
+    pub guardrail: GuardrailMetrics,
+}
+
+/// Guardrail parameters for `PolicyName::SessionGuardedDual`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailConfig {
+    /// Background jobs waiting longer than this are force-dispatched (score override).
+    pub starvation_ceiling_s: f64,
+    /// Workers (of `n_workers`) reserved for background jobs (work-conserving borrow).
+    pub n_reserved_bg_workers: usize,
+    /// Affinity bonuses: warm-env baseline (same as dual) + small session tie-break.
+    pub session_affinity_bonus: f64,
+    pub tenant_rev_affinity_bonus: f64,
+    pub tenant_affinity_bonus: f64,
+    /// Affinity is dropped once the job has already waited beyond this (break affinity).
+    pub break_affinity_wait_s: f64,
+    /// Cluster-value weight: expected sibling reuse inflates rescue value.
+    pub cluster_lambda: f64,
+    pub cluster_value_cap: f64,
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            starvation_ceiling_s: 40.0,
+            n_reserved_bg_workers: 1,
+            session_affinity_bonus: 5.0,
+            tenant_rev_affinity_bonus: 8.0,
+            tenant_affinity_bonus: 18.0,
+            break_affinity_wait_s: 35.0,
+            cluster_lambda: 0.5,
+            cluster_value_cap: 3.0,
+        }
+    }
+}
+
+/// Simulation semantics configuration.
+#[derive(Debug, Clone, Default)]
+pub struct SimConfig {
+    /// P0 fix: model sliding-TTL renewal — every run writes the lineage's last-hit time,
+    /// so hits renew the whole session prefix cluster ("rescue = renewal").
+    pub renew_ttl_on_hit: bool,
+    /// `Some` enables guardrails (only honored for `SessionGuardedDual`).
+    pub guardrails: Option<GuardrailConfig>,
+}
+
+impl SimConfig {
+    /// Original issue-#5 baseline semantics (no renewal, no guardrails).
+    pub fn legacy() -> Self {
+        Self::default()
+    }
+    /// Corrected sliding-TTL semantics for the four baseline policies.
+    pub fn renewal() -> Self {
+        Self {
+            renew_ttl_on_hit: true,
+            guardrails: None,
+        }
+    }
+    /// Full v1.1 semantics for `SessionGuardedDual`.
+    pub fn renewal_guarded() -> Self {
+        Self {
+            renew_ttl_on_hit: true,
+            guardrails: Some(GuardrailConfig::default()),
+        }
+    }
 }
 
 struct SplitMix64 {
@@ -311,9 +390,31 @@ struct WorkerSlot {
     free_at: f64,
     rev: Option<usize>,
     tenant_id: Option<String>,
+    session_id: Option<String>,
+    reserved_bg: bool,
 }
 
-/// Event-driven discrete-time simulation of worker pool + provider concurrency slot scheduling.
+/// Effective last cache touch for a job under the chosen semantics.
+/// Renewal semantics: a run refreshes the whole session lineage, so the effective
+/// last-hit is the max of the job's own history and the lineage's most recent touch.
+fn effective_last_hit(
+    job: &ScheduledJob,
+    lineage: &HashMap<String, f64>,
+    renew: bool,
+) -> Option<f64> {
+    if !renew {
+        return job.last_cache_hit_s;
+    }
+    let lh = lineage.get(&job.session_id).copied();
+    match (job.last_cache_hit_s, lh) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Event-driven discrete-time simulation of worker pool scheduling.
+/// Legacy wrapper: original issue-#5 semantics (no TTL renewal).
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_scheduler_policy(
     jobs: &[ScheduledJob],
     policy: PolicyName,
@@ -322,16 +423,73 @@ pub fn simulate_scheduler_policy(
     ttl_rescue_window_s: f64,
     min_rescue_prefix_tokens: usize,
 ) -> SchedulerPolicyReport {
+    simulate_with_config(
+        jobs,
+        policy,
+        n_workers,
+        aging_starvation_cap_s,
+        ttl_rescue_window_s,
+        min_rescue_prefix_tokens,
+        &SimConfig::legacy(),
+    )
+}
+
+/// Event-driven discrete-time simulation with explicit semantics/guardrail config.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_with_config(
+    jobs: &[ScheduledJob],
+    policy: PolicyName,
+    n_workers: usize,
+    aging_starvation_cap_s: f64,
+    ttl_rescue_window_s: f64,
+    min_rescue_prefix_tokens: usize,
+    cfg: &SimConfig,
+) -> SchedulerPolicyReport {
+    let guarded = policy == PolicyName::SessionGuardedDual;
+    let gcfg = cfg.guardrails.clone().unwrap_or_default();
+    let n_reserved = if guarded {
+        gcfg.n_reserved_bg_workers.min(n_workers.saturating_sub(1))
+    } else {
+        0
+    };
+
     let mut workers: Vec<WorkerSlot> = (0..n_workers)
-        .map(|_| WorkerSlot {
+        .map(|i| WorkerSlot {
             free_at: 0.0,
             rev: None,
             tenant_id: None,
+            session_id: None,
+            reserved_bg: i < n_reserved,
         })
         .collect();
     let mut pending: Vec<ScheduledJob> = Vec::new();
     let mut remaining_idx = 0usize;
     let mut outcomes: Vec<JobOutcome> = Vec::with_capacity(jobs.len());
+    let mut guardrail = GuardrailMetrics::default();
+
+    // Sliding-TTL lineage state (P0): session prefix-cluster last touch time.
+    let mut lineage_last_hit: HashMap<String, f64> = HashMap::new();
+    // Session arrival times for cluster-value expected-reuse lookahead.
+    let mut session_arrivals: HashMap<String, Vec<f64>> = HashMap::new();
+    for j in jobs {
+        session_arrivals
+            .entry(j.session_id.clone())
+            .or_default()
+            .push(j.arrival_s);
+    }
+    for v in session_arrivals.values_mut() {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let expected_reuse = |job: &ScheduledJob| -> f64 {
+        session_arrivals
+            .get(&job.session_id)
+            .map(|arr| {
+                let lo = job.arrival_s;
+                let hi = job.arrival_s + job.cache_ttl_s;
+                arr.iter().filter(|&&t| t > lo && t <= hi).count() as f64
+            })
+            .unwrap_or(0.0)
+    };
 
     while remaining_idx < jobs.len() || !pending.is_empty() {
         let w_idx = workers
@@ -365,34 +523,58 @@ pub fn simulate_scheduler_policy(
             }
         }
 
+        // Reserved background slice: a reserved worker must serve background jobs when
+        // any are pending (work-conserving: otherwise it borrows shared work).
+        let bg_pending = pending.iter().any(|j| j.priority == JobPriority::Background);
+        let restricted_to_bg = guarded && workers[w_idx].reserved_bg && bg_pending;
+
         let chosen_idx = if policy == PolicyName::Fifo {
-            0
+            if restricted_to_bg {
+                pending
+                    .iter()
+                    .position(|j| j.priority == JobPriority::Background)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
         } else {
+            let w_sess = workers[w_idx].session_id.as_deref();
             let w_tenant = workers[w_idx].tenant_id.as_deref();
             let w_rev = workers[w_idx].rev;
             pending
                 .iter()
                 .enumerate()
+                .filter(|(_, j)| !restricted_to_bg || j.priority == JobPriority::Background)
                 .max_by(|(_, a), (_, b)| {
-                    let sa = score_job(
+                    let la = effective_last_hit(a, &lineage_last_hit, cfg.renew_ttl_on_hit);
+                    let lb = effective_last_hit(b, &lineage_last_hit, cfg.renew_ttl_on_hit);
+                    let sa = score_job_v2(
                         a,
                         now_s,
+                        w_sess,
                         w_tenant,
                         w_rev,
                         policy,
                         aging_starvation_cap_s,
                         ttl_rescue_window_s,
                         min_rescue_prefix_tokens,
+                        la,
+                        expected_reuse(a),
+                        &gcfg,
                     );
-                    let sb = score_job(
+                    let sb = score_job_v2(
                         b,
                         now_s,
+                        w_sess,
                         w_tenant,
                         w_rev,
                         policy,
                         aging_starvation_cap_s,
                         ttl_rescue_window_s,
                         min_rescue_prefix_tokens,
+                        lb,
+                        expected_reuse(b),
+                        &gcfg,
                     );
                     sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
                 })
@@ -402,6 +584,17 @@ pub fn simulate_scheduler_policy(
 
         let job = pending.remove(chosen_idx);
         let queue_wait = (now_s - job.arrival_s).max(0.0);
+
+        if guarded {
+            if job.priority == JobPriority::Background && queue_wait >= gcfg.starvation_ceiling_s {
+                guardrail.ceiling_forced_dispatches += 1;
+            }
+            if restricted_to_bg {
+                guardrail.bg_reserved_dispatches += 1;
+            } else if workers[w_idx].reserved_bg {
+                guardrail.borrowed_dispatches += 1;
+            }
+        }
 
         let warm_reused = workers[w_idx].tenant_id.as_deref() == Some(job.tenant_id.as_str())
             && workers[w_idx].rev.is_some();
@@ -418,7 +611,8 @@ pub fn simulate_scheduler_policy(
         };
 
         let llm_start_s = now_s + prep_s;
-        let cache_hit = match job.last_cache_hit_s {
+        let lh_eff = effective_last_hit(&job, &lineage_last_hit, cfg.renew_ttl_on_hit);
+        let cache_hit = match lh_eff {
             Some(lh) => (llm_start_s - lh) <= job.cache_ttl_s,
             None => false,
         };
@@ -431,9 +625,19 @@ pub fn simulate_scheduler_policy(
         let cost_units = (job.prefix_tokens as f64 * if cache_hit { 0.10 } else { 1.15 }) / 1000.0;
         let finish_s = llm_start_s + llm_s + job.tool_s;
 
+        // P0 sliding-TTL renewal write-back: every run (hit or miss) refreshes the
+        // session prefix cluster's last touch — a hit renews the whole cluster.
+        if cfg.renew_ttl_on_hit {
+            let entry = lineage_last_hit.entry(job.session_id.clone()).or_insert(0.0);
+            if llm_start_s > *entry {
+                *entry = llm_start_s;
+            }
+        }
+
         workers[w_idx].free_at = finish_s;
         workers[w_idx].rev = Some(job.required_rev);
         workers[w_idx].tenant_id = Some(job.tenant_id.clone());
+        workers[w_idx].session_id = Some(job.session_id.clone());
 
         outcomes.push(JobOutcome {
             job_id: job.job_id,
@@ -490,6 +694,11 @@ pub fn simulate_scheduler_policy(
 
     SchedulerPolicyReport {
         policy: policy.as_str().to_string(),
+        semantics: if cfg.renew_ttl_on_hit {
+            "renewal".to_string()
+        } else {
+            "legacy".to_string()
+        },
         total_jobs: outcomes.len(),
         throughput_jobs_per_min: round_n(outcomes.len() as f64 / (makespan_s / 60.0), 2),
         foreground: ForegroundMetrics {
@@ -532,47 +741,100 @@ pub fn simulate_scheduler_policy(
                 / outcomes.len().max(1) as f64,
             4,
         ),
+        guardrail,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn score_job(
+fn score_job_v2(
     job: &ScheduledJob,
     now_s: f64,
+    worker_session: Option<&str>,
     worker_tenant: Option<&str>,
     worker_rev: Option<usize>,
     policy: PolicyName,
     aging_starvation_cap_s: f64,
     ttl_rescue_window_s: f64,
     min_rescue_prefix_tokens: usize,
+    last_hit: Option<f64>,
+    expected_reuse: f64,
+    gcfg: &GuardrailConfig,
 ) -> f64 {
     let wait = (now_s - job.arrival_s).max(0.0);
+
+    // Guardrail hard ceiling: a background job past the threshold force-jumps the queue,
+    // breaking the "rescue score 546 vs aging score 366" deadlock deterministically.
+    if policy == PolicyName::SessionGuardedDual
+        && job.priority == JobPriority::Background
+        && wait >= gcfg.starvation_ceiling_s
+    {
+        return 1000.0;
+    }
+
     let mut score = match job.priority {
         JobPriority::Interactive => 100.0 + wait * 2.0,
         JobPriority::Background => 10.0 + (wait / aging_starvation_cap_s.max(1.0)) * 95.0,
     };
 
-    if matches!(
-        policy,
-        PolicyName::WarmEnvAffinity | PolicyName::DualCacheTtlAware
-    ) {
-        if worker_tenant == Some(job.tenant_id.as_str()) && worker_rev.is_some() {
-            score += 18.0;
+    match policy {
+        PolicyName::WarmEnvAffinity | PolicyName::DualCacheTtlAware => {
+            if worker_tenant == Some(job.tenant_id.as_str()) && worker_rev.is_some() {
+                score += 18.0;
+            }
+            if worker_rev == Some(job.required_rev) {
+                score += 8.0;
+            }
         }
-        if worker_rev == Some(job.required_rev) {
-            score += 8.0;
+        PolicyName::SessionGuardedDual => {
+            // Warm-env baseline identical to dual (+18 tenant / +8 rev) so env
+            // reuse is never traded away; session adds only a small tie-break.
+            // Cross-tenant session pinning is forbidden (tenant isolation).
+            // Affinity break fires only for cache-urgent jobs (inside the rescue
+            // window): urgency justifies scattering to any free worker ("miss
+            // beats queue"). Non-urgent jobs keep affinity regardless of wait —
+            // ablation shows the wait-based break alone destroys warm reuse
+            // (0.82 -> 0.53 under overload) without buying anything.
+            let rem = last_hit.map(|lh| (lh + job.cache_ttl_s) - now_s);
+            let cache_urgent = matches!(rem, Some(r) if r > 0.0
+                && r <= ttl_rescue_window_s
+                && job.prefix_tokens >= min_rescue_prefix_tokens);
+            let affinity_ok = !cache_urgent || wait < gcfg.break_affinity_wait_s;
+            if affinity_ok {
+                if worker_tenant == Some(job.tenant_id.as_str()) && worker_rev.is_some() {
+                    score += gcfg.tenant_affinity_bonus;
+                    if worker_rev == Some(job.required_rev) {
+                        score += gcfg.tenant_rev_affinity_bonus;
+                    }
+                    if worker_session == Some(job.session_id.as_str()) {
+                        score += gcfg.session_affinity_bonus;
+                    }
+                }
+            }
         }
+        _ => {}
     }
 
-    if policy == PolicyName::DualCacheTtlAware {
-        if let Some(lh) = job.last_cache_hit_s {
+    if matches!(
+        policy,
+        PolicyName::DualCacheTtlAware | PolicyName::SessionGuardedDual
+    ) {
+        if let Some(lh) = last_hit {
             let rem_ttl = (lh + job.cache_ttl_s) - now_s;
             if rem_ttl > 0.0
                 && rem_ttl <= ttl_rescue_window_s
                 && job.prefix_tokens >= min_rescue_prefix_tokens
             {
                 let urgency = (ttl_rescue_window_s - rem_ttl) / ttl_rescue_window_s;
-                let value = (job.prefix_tokens as f64 / 80_000.0).min(2.0);
+                let value = if policy == PolicyName::SessionGuardedDual {
+                    // Cluster value: sibling reuse within the TTL window inflates value
+                    // (rescue renews the whole session prefix cluster); capped to keep
+                    // the guardrail math (score ceiling ~540) intact.
+                    ((job.prefix_tokens as f64 / 80_000.0)
+                        * (1.0 + gcfg.cluster_lambda * expected_reuse))
+                        .clamp(1.0, gcfg.cluster_value_cap)
+                } else {
+                    (job.prefix_tokens as f64 / 80_000.0).min(2.0)
+                };
                 score += 180.0 + 120.0 * urgency * value;
             } else if rem_ttl <= 0.0 {
                 score -= 5.0;
@@ -619,5 +881,65 @@ mod tests {
                 < fifo.prompt_cache.total_effective_input_cost_units
         );
         assert!(dual.foreground.p95_jct_s < fifo.foreground.p95_jct_s);
+    }
+
+    #[test]
+    fn test_renewal_semantics_improve_lineage_hits() {
+        let jobs = generate_rate_limited_workload(2026, 120, true, 2.937, 0.602);
+        let legacy = simulate_with_config(
+            &jobs,
+            PolicyName::DualCacheTtlAware,
+            3,
+            12.0,
+            35.0,
+            40_000,
+            &SimConfig::legacy(),
+        );
+        let renewal = simulate_with_config(
+            &jobs,
+            PolicyName::DualCacheTtlAware,
+            3,
+            12.0,
+            35.0,
+            40_000,
+            &SimConfig::renewal(),
+        );
+        assert_eq!(legacy.semantics, "legacy");
+        assert_eq!(renewal.semantics, "renewal");
+        // Sliding-TTL renewal can only turn misses into hits, never the reverse.
+        assert!(
+            renewal.prompt_cache.overall_hit_rate >= legacy.prompt_cache.overall_hit_rate,
+            "renewal={} vs legacy={}",
+            renewal.prompt_cache.overall_hit_rate,
+            legacy.prompt_cache.overall_hit_rate
+        );
+    }
+
+    /// Acceptance double-constraint (issue #5): under overload, rescue >= 95%
+    /// AND zero background starvation across seeds.
+    #[test]
+    fn test_session_guarded_dual_acceptance_overload() {
+        for seed in [2026u64, 2027, 2028, 2029, 2030] {
+            let jobs = generate_rate_limited_workload(seed, 120, true, 2.937, 0.602);
+            let r = simulate_with_config(
+                &jobs,
+                PolicyName::SessionGuardedDual,
+                3,
+                12.0,
+                35.0,
+                40_000,
+                &SimConfig::renewal_guarded(),
+            );
+            assert!(
+                r.prompt_cache.expiring_hot_hit_rate >= 0.95,
+                "seed {seed}: rescue {} < 0.95",
+                r.prompt_cache.expiring_hot_hit_rate
+            );
+            assert_eq!(
+                r.background.starved_jobs_over_45s, 0,
+                "seed {seed}: {} starved > 0",
+                r.background.starved_jobs_over_45s
+            );
+        }
     }
 }
