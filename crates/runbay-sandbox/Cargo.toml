@@ -1,6 +1,6 @@
 [package]
 name = "runbay-sandbox"
-description = "Cross-platform OS subprocess sandbox isolation (macOS Seatbelt / Linux bubblewrap) and poisoned worker quarantine registry"
+description = "Cross-platform OS subprocess sandbox isolation (macOS Seatbelt / Linux bubblewrap or Landlock + seccomp) and poisoned worker quarantine registry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,5 +13,12 @@ serde.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+walkdir.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+cc = "1"
+sha2.workspace = true

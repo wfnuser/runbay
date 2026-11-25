@@ -86,7 +86,7 @@ fn build_synthetic_repo(root: &Path, n_files: usize) -> Result<Vec<String>> {
 }
 
 async fn run_correctness_oracle(work_dir: &Path) -> Result<serde_json::Value> {
-    // 1. Real OS sandbox isolation (macOS Seatbelt or Linux bubblewrap)
+    // 1. Real OS sandbox isolation (selected macOS or Linux backend)
     let probe_sb = LocalOsSandbox::new(work_dir, &[]);
     let sb_report = if probe_sb.is_available() {
         serde_json::to_value(run_os_sandbox_verification_suite(
@@ -96,7 +96,7 @@ async fn run_correctness_oracle(work_dir: &Path) -> Result<serde_json::Value> {
         serde_json::json!({
             "measurement_type": "real_os_kernel_exec",
             "all_invariants_passed": false,
-            "note": "No supported OS sandbox binary (sandbox-exec / bwrap) found on this host"
+            "note": "Requested OS sandbox is unavailable on this host"
         })
     };
     let sb_ok = sb_report["all_invariants_passed"]
@@ -272,7 +272,7 @@ async fn run_seatbelt_gateway_e2e(work_dir: &Path) -> Result<serde_json::Value> 
                -H \"Content-Type: application/json\" \
                -d '{\"model\":\"beta-model\",\"stream\":false}'"
                 .to_string(),
-            "linux_bwrap_unshare_net_unix_socket",
+            sb.gateway_transport(),
         )
     };
 

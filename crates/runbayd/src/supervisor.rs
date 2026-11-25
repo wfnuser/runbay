@@ -8,15 +8,18 @@ use crate::models::{
     RunEvent, RunRecord, RunState, SubmitRunRequest,
 };
 use crate::store::DaemonStore;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use parking_lot::Mutex;
 use runbay_gateway::SecretlessLoopbackGateway;
 use runbay_mvcc::MVCCWorkspaceStore;
-use runbay_sandbox::LocalOsSandbox;
+use runbay_sandbox::{
+    clean_interrupted_cgroup, validate_cgroup_parent, LocalOsSandbox, SandboxCgroup, SandboxLimits,
+};
 use runbay_scheduler::{CancelToken, GuardedRunSink};
 use std::collections::HashMap;
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -35,6 +38,8 @@ pub struct DaemonConfig {
     pub max_concurrent_runs: usize,
     pub max_queued_runs: usize,
     pub default_timeout_secs: u64,
+    pub cgroup_root: Option<PathBuf>,
+    pub sandbox_limits: SandboxLimits,
     pub allowed_workspace_roots: Vec<PathBuf>,
     pub upstream_url: Option<String>,
     pub upstream_api_key: Option<String>,
@@ -84,6 +89,7 @@ impl Drop for QueueCounterGuard {
 }
 
 pub struct DaemonSupervisor {
+    _state_lock: fs::File,
     pub config: DaemonConfig,
     pub store: DaemonStore,
     pub adapters: AdapterRegistry,
@@ -102,13 +108,35 @@ impl DaemonSupervisor {
     pub async fn new(config: DaemonConfig) -> Result<Arc<Self>> {
         fs::create_dir_all(&config.state_dir)?;
         let state_dir = fs::canonicalize(&config.state_dir)?;
+        // Recovery may terminate interrupted cgroups. Only the current state owner may do it.
+        let control_dir = state_dir.join("control");
+        fs::create_dir_all(&control_dir)?;
+        let state_lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(control_dir.join("daemon.lock"))?;
+        // SAFETY: state_lock retains the open descriptor for the supervisor's lifetime.
+        if unsafe { libc::flock(state_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("cannot lock daemon state directory");
+        }
         fs::create_dir_all(state_dir.join("agents"))?;
 
         let mut cfg = config;
         cfg.state_dir = state_dir.clone();
 
         let store = DaemonStore::open(&state_dir.join("runbayd.sqlite"))?;
-        let _recovered = store.recover_interrupted_runs()?;
+        if let Some(parent) = &mut cfg.cgroup_root {
+            *parent = fs::canonicalize(&*parent)?;
+            validate_cgroup_parent(parent)?;
+        }
+        store.recover_interrupted_runs(|id| {
+            if let Some(parent) = &cfg.cgroup_root {
+                clean_interrupted_cgroup(parent, id)?;
+            }
+            Ok(())
+        })?;
 
         let adapters = AdapterRegistry::build(cfg.enable_fixture_adapter, cfg.codex_bin.clone())?;
 
@@ -135,6 +163,7 @@ impl DaemonSupervisor {
 
         let max_conc = cfg.max_concurrent_runs.max(1);
         Ok(Arc::new(Self {
+            _state_lock: state_lock,
             config: cfg,
             store,
             adapters,
@@ -153,23 +182,18 @@ impl DaemonSupervisor {
     pub fn status(&self) -> Result<DaemonStatusResponse> {
         let probe_sb = LocalOsSandbox::new(&self.config.state_dir, &[]);
         let agents = self.store.list_agents()?;
-        let gw_transport = if self.gateway.is_some() {
-            if cfg!(target_os = "macos") {
-                Some("macos_seatbelt_loopback_tcp".to_string())
-            } else if self.gateway_unix_socket.is_some() {
-                Some("linux_bwrap_unshare_net_unix_socket".to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let available = probe_sb.is_available();
+        let gw_transport = (self.gateway.is_some()
+            && available
+            && (cfg!(target_os = "macos") || self.gateway_unix_socket.is_some()))
+        .then(|| probe_sb.gateway_transport().to_owned());
         Ok(DaemonStatusResponse {
             service: "runbayd".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox_mechanism: probe_sb.mechanism_name().to_string(),
-            sandbox_available: probe_sb.is_available(),
+            sandbox_available: available,
+            sandbox_resource_limits: self.config.cgroup_root.as_ref().map(|_| self.config.sandbox_limits),
             gateway_enabled: self.gateway.is_some(),
             gateway_transport: gw_transport,
             max_concurrent_runs: self.config.max_concurrent_runs,
@@ -391,6 +415,15 @@ impl DaemonSupervisor {
             );
         }
 
+        if let Some(limits) = req.resource_limits {
+            if self.config.cgroup_root.is_none() {
+                bail!("INVALID_REQUEST: per-run resource limits require a configured Linux cgroup parent");
+            }
+            if !limits.fits_within(self.config.sandbox_limits) {
+                bail!("INVALID_REQUEST: resource_limits exceed the daemon's per-run ceilings");
+            }
+        }
+
         // Bounded live queue admission check
         let prev_queued = self.queued_runs.fetch_add(1, Ordering::SeqCst);
         if prev_queued >= self.config.max_queued_runs {
@@ -522,7 +555,7 @@ impl DaemonSupervisor {
         let active_opt = self.active_runs.lock().get(run_id).cloned();
         if let Some(active) = active_opt {
             active.cancel_token.cancel(reason);
-            active.cancel_notify.notify_waiters();
+            active.cancel_notify.notify_one();
             // Wait up to 3 seconds for process-group termination & terminal state persistence.
             let _ =
                 tokio::time::timeout(Duration::from_secs(3), active.done_notify.notified()).await;
@@ -540,7 +573,7 @@ impl DaemonSupervisor {
             .collect();
         for (_rid, entry) in &entries {
             entry.cancel_token.cancel("daemon_shutdown");
-            entry.cancel_notify.notify_waiters();
+            entry.cancel_notify.notify_one();
         }
         for (_rid, entry) in entries {
             let _ =
@@ -740,7 +773,7 @@ impl DaemonSupervisor {
             gateway_run_token: gw_guard.as_ref().map(|g| g.token.clone()),
         };
 
-        let prepared = match self
+        let mut prepared = match self
             .adapters
             .get(&agent.runtime)
             .ok_or_else(|| anyhow!("adapter '{}' unavailable", agent.runtime))
@@ -768,33 +801,38 @@ impl DaemonSupervisor {
         // 4. Spawn real OS-sandboxed process in its own POSIX process group.
         let pool_root = self.config.state_dir.join("agents");
         let control_token_dir = self.config.state_dir.join("control");
-        let _ = fs::create_dir_all(&control_token_dir);
-        let sb = LocalOsSandbox::new(&pool_root, &[control_token_dir]);
-        if !sb.is_available() {
-            mvcc.abort_branch(&branch.branch_id, "sandbox_unavailable");
-            drop(gw_guard);
-            drop(lease);
-            drop(permit);
-            self.finalize_run(
-                &mut run,
-                &active,
-                &sink,
-                RunState::Failed,
-                None,
-                Some("sandbox_unavailable"),
-                Some("No supported OS sandbox binary available on this host"),
-            );
-            return;
-        }
-
-        let mut sandboxed = match sb.spawn_async(
-            &prepared.command,
-            &branch.workspace_dir,
-            &prepared.sandbox_opts,
-        ) {
-            Ok(child) => child,
-            Err(e) => {
-                mvcc.abort_branch(&branch.branch_id, "spawn_failed");
+        let limits = req.resource_limits.unwrap_or(self.config.sandbox_limits);
+        prepared.sandbox_opts.cgroup =
+            self.config
+                .cgroup_root
+                .as_ref()
+                .map(|parent| SandboxCgroup {
+                    parent: parent.clone(),
+                    run_id: run.run_id.clone(),
+                    limits,
+                });
+        let workspace = branch.workspace_dir.clone();
+        let requested_limits = prepared
+            .sandbox_opts
+            .cgroup
+            .as_ref()
+            .map(|group| group.limits);
+        let launch = tokio::task::spawn_blocking(move || {
+            let sandbox = LocalOsSandbox::new(pool_root, &[control_token_dir]);
+            sandbox
+                .check_available()
+                .map_err(|e| ("sandbox_unavailable", e))?;
+            let child = sandbox
+                .spawn_async(&prepared.command, &workspace, &prepared.sandbox_opts)
+                .map_err(|e| ("spawn_failed", e))?;
+            Ok((child, sandbox.gateway_transport()))
+        })
+        .await
+        .unwrap_or_else(|e| Err(("spawn_failed", e.into())));
+        let (mut sandboxed, transport) = match launch {
+            Ok(value) => value,
+            Err((code, error)) => {
+                mvcc.abort_branch(&branch.branch_id, code);
                 drop(gw_guard);
                 drop(lease);
                 drop(permit);
@@ -804,8 +842,8 @@ impl DaemonSupervisor {
                     &sink,
                     RunState::Failed,
                     None,
-                    Some("spawn_failed"),
-                    Some(&e.to_string()),
+                    Some(code),
+                    Some(&format!("{error:#}")),
                 );
                 return;
             }
@@ -817,7 +855,7 @@ impl DaemonSupervisor {
         run.sandbox_enforced = true;
         run.network_isolated = prepared.network_isolated;
         run.secretless_gateway = prepared.secretless_gateway;
-        run.gateway_transport = prepared.gateway_transport.clone();
+        run.gateway_transport = prepared.secretless_gateway.then(|| transport.to_owned());
         let _ = self.store.update_run(&run);
 
         self.emit_lifecycle_event(
@@ -830,6 +868,7 @@ impl DaemonSupervisor {
                 "pid": sandboxed.pid(),
                 "pgid": sandboxed.pgid(),
                 "workspace_rev": run.workspace_rev,
+                "resource_limits": requested_limits,
                 "sandbox_enforced": true,
                 "network_isolated": run.network_isolated,
                 "secretless_gateway": run.secretless_gateway,
@@ -909,92 +948,77 @@ impl DaemonSupervisor {
             res = sandboxed.child.wait() => WaitOutcome::Exited(res),
         };
 
-        // 7. Terminate & reap entire process group on cancel/timeout, revoke gateway token,
-        //    drain stdout/stderr readers, and release MVCC lease.
-        let (final_state, exit_code, err_code, err_msg) = match outcome {
-            WaitOutcome::Exited(Ok(status)) => {
-                if let Some(h) = stdout_handle {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-                }
-                if let Some(h) = stderr_handle {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
-                }
-                let code = status.code();
-                if status.success() {
-                    (RunState::Succeeded, code, None, None)
-                } else {
-                    mvcc.abort_branch(&branch.branch_id, "nonzero_exit");
-                    (
-                        RunState::Failed,
-                        code,
-                        Some("nonzero_exit".to_string()),
-                        Some(format!("Process exited with code {}", code.unwrap_or(-1))),
-                    )
-                }
+        // Release the upstream credential as soon as the process exits or cancellation wins.
+        drop(gw_guard);
+        let drain_timeout = if matches!(&outcome, WaitOutcome::Exited(Ok(_))) {
+            Duration::from_secs(2)
+        } else {
+            let _ = sandboxed
+                .terminate_process_group(Duration::from_millis(400))
+                .await;
+            Duration::from_millis(300)
+        };
+        let cleanup = sandboxed.finish_resources_with_oom().await;
+        for handle in [stdout_handle, stderr_handle].into_iter().flatten() {
+            let _ = tokio::time::timeout(drain_timeout, handle).await;
+        }
+
+        let (final_state, exit_code, err_code, err_msg) = match (cleanup, outcome) {
+            (Err(error), _) => {
+                mvcc.abort_branch(&branch.branch_id, "resource_cleanup_failed");
+                (
+                    RunState::Failed,
+                    None,
+                    Some("resource_cleanup_failed"),
+                    Some(format!("{error:#}")),
+                )
             }
-            WaitOutcome::Exited(Err(e)) => {
+            (Ok(true), WaitOutcome::Exited(Ok(status))) => {
+                mvcc.abort_branch(&branch.branch_id, "oom_killed");
+                (
+                    RunState::Failed,
+                    status.code(),
+                    Some("oom_killed"),
+                    Some("The run exceeded its cgroup memory limit".to_owned()),
+                )
+            }
+            (Ok(_), WaitOutcome::Exited(Ok(status))) if status.success() => {
+                (RunState::Succeeded, status.code(), None, None)
+            }
+            (Ok(_), WaitOutcome::Exited(Ok(status))) => {
+                mvcc.abort_branch(&branch.branch_id, "nonzero_exit");
+                let code = status.code();
+                (
+                    RunState::Failed,
+                    code,
+                    Some("nonzero_exit"),
+                    Some(format!("Process exited with code {}", code.unwrap_or(-1))),
+                )
+            }
+            (Ok(_), WaitOutcome::Exited(Err(error))) => {
                 mvcc.abort_branch(&branch.branch_id, "wait_error");
                 (
                     RunState::Failed,
                     None,
-                    Some("wait_error".to_string()),
-                    Some(e.to_string()),
+                    Some("wait_error"),
+                    Some(error.to_string()),
                 )
             }
-            WaitOutcome::Cancelled(reason) => {
-                // Immediately revoke gateway credentials and kill+reap entire process group.
-                drop(gw_guard);
-                let _ = sandboxed
-                    .terminate_process_group(Duration::from_millis(400))
-                    .await;
-                if let Some(h) = stdout_handle {
-                    let _ = tokio::time::timeout(Duration::from_millis(300), h).await;
-                }
-                if let Some(h) = stderr_handle {
-                    let _ = tokio::time::timeout(Duration::from_millis(300), h).await;
-                }
+            (Ok(_), WaitOutcome::Cancelled(reason)) => {
                 mvcc.abort_branch(&branch.branch_id, &reason);
-                drop(lease);
-                drop(permit);
-                self.finalize_run(
-                    &mut run,
-                    &active,
-                    &sink,
-                    RunState::Cancelled,
-                    None,
-                    Some("cancelled"),
-                    Some(&reason),
-                );
-                return;
+                (RunState::Cancelled, None, Some("cancelled"), Some(reason))
             }
-            WaitOutcome::TimedOut => {
-                drop(gw_guard);
-                let _ = sandboxed
-                    .terminate_process_group(Duration::from_millis(400))
-                    .await;
-                if let Some(h) = stdout_handle {
-                    let _ = tokio::time::timeout(Duration::from_millis(300), h).await;
-                }
-                if let Some(h) = stderr_handle {
-                    let _ = tokio::time::timeout(Duration::from_millis(300), h).await;
-                }
+            (Ok(_), WaitOutcome::TimedOut) => {
                 mvcc.abort_branch(&branch.branch_id, "timeout");
-                drop(lease);
-                drop(permit);
-                self.finalize_run(
-                    &mut run,
-                    &active,
-                    &sink,
+                (
                     RunState::Failed,
                     None,
                     Some("timeout"),
-                    Some(&format!("Run timed out after {timeout_secs}s")),
-                );
-                return;
+                    Some(format!("Run timed out after {timeout_secs}s")),
+                )
             }
         };
 
-        drop(gw_guard);
         drop(lease);
         drop(permit);
 
@@ -1004,7 +1028,7 @@ impl DaemonSupervisor {
             &sink,
             final_state,
             exit_code,
-            err_code.as_deref(),
+            err_code,
             err_msg.as_deref(),
         );
     }

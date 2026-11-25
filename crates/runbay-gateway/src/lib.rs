@@ -1157,6 +1157,11 @@ mod tests {
                     .to_string(),
             )
         } else {
+            // Positive control for the exact host port tested from the isolated namespace below.
+            tokio::net::TcpStream::connect(("127.0.0.1", gw.port()))
+                .await
+                .unwrap();
+            env_overrides.insert("HOST_GATEWAY_PORT".into(), gw.port().to_string());
             let sock_path = gw
                 .bind_unix_socket(tmp.path().join("gw_sock/gateway.sock"))
                 .await
@@ -1173,11 +1178,22 @@ mod tests {
                     env_overrides,
                     ..Default::default()
                 },
-                "curl -sS --max-time 5 --unix-socket \"$RUNBAY_GATEWAY_SOCKET\" \
-                   -X POST \"http://localhost/v1/chat/completions\" \
-                   -H \"Authorization: Bearer $RUNBAY_RUN_TOKEN\" \
-                   -H \"Content-Type: application/json\" \
-                   -d '{\"model\":\"test-model\",\"stream\":false}'"
+                r#"python3 -c '
+import errno, os, socket
+for address in [("127.0.0.1", int(os.environ["HOST_GATEWAY_PORT"])), ("1.1.1.1", 443)]:
+    try:
+        connection = socket.socket()
+    except OSError as e:
+        if e.errno in (errno.EAFNOSUPPORT, errno.EPERM):
+            continue
+        raise
+    with connection:
+        connection.settimeout(1)
+        if connection.connect_ex(address) == 0:
+            raise SystemExit(f"unexpected TCP connection to {address}")
+' && curl -fsS --max-time 5 --unix-socket "$RUNBAY_GATEWAY_SOCKET" -X POST \
+    http://localhost/v1/chat/completions -H "Authorization: Bearer $RUNBAY_RUN_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"model":"test-model","stream":false}'"#
                     .to_string(),
             )
         };
@@ -1199,6 +1215,7 @@ mod tests {
 
         assert_eq!(res.returncode, 0, "stderr: {}", res.stderr);
         assert!(res.stdout.contains("Multi-Version Concurrency Control"));
+        assert_eq!(gw.stats().calls[0].status_code, 200);
         assert!(!res.stdout.contains("host-real-key-never-in-sandbox"));
         assert_eq!(
             mock.seen_auth_headers(),

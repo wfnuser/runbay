@@ -83,7 +83,10 @@ impl DaemonStore {
     /// Explicit restart recovery: processes do not survive daemon restarts, so any
     /// `queued` or `running` rows from a prior daemon process are transitioned cleanly
     /// to `failed` with `error_code = "daemon_restarted"`.
-    pub fn recover_interrupted_runs(&self) -> Result<Vec<String>> {
+    pub fn recover_interrupted_runs(
+        &self,
+        cleanup: impl Fn(&str) -> Result<()>,
+    ) -> Result<Vec<String>> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         let mut stmt =
@@ -95,6 +98,7 @@ impl DaemonStore {
 
         let mut recovered = Vec::with_capacity(rows.len());
         for (run_id, agent_id) in rows {
+            cleanup(&run_id)?;
             conn.execute(
                 "UPDATE runs
                  SET state = 'failed',

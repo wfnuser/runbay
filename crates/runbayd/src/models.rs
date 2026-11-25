@@ -99,6 +99,8 @@ impl RunState {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubmitRunRequest {
     pub prompt: String,
+    #[serde(default)]
+    pub resource_limits: Option<runbay_sandbox::SandboxLimits>,
     #[serde(default = "default_priority")]
     pub priority: String,
     #[serde(default)]
@@ -165,6 +167,8 @@ pub struct DaemonStatusResponse {
     pub platform: String,
     pub sandbox_mechanism: String,
     pub sandbox_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_resource_limits: Option<runbay_sandbox::SandboxLimits>,
     pub gateway_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_transport: Option<String>,

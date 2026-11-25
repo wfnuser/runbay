@@ -171,7 +171,10 @@ async fn handle_http_request(sup: Arc<DaemonSupervisor>, req: Request<Incoming>)
 
     // GET /v1/status
     if method == Method::GET && path == "/v1/status" {
-        return match sup.status() {
+        let status = tokio::task::spawn_blocking(move || sup.status())
+            .await
+            .unwrap_or_else(|e| Err(e.into()));
+        return match status {
             Ok(st) => json_resp(StatusCode::OK, serde_json::to_value(st).unwrap()),
             Err(e) => error_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -523,9 +526,9 @@ async fn stream_agent_sse(sup: Arc<DaemonSupervisor>, agent_id: String) -> Boxed
 }
 
 pub async fn run_loopback_server(config: DaemonConfig) -> Result<()> {
-    let token_path = write_control_token_file(&config.state_dir, &config.control_token)?;
     let port = config.port;
     let sup = DaemonSupervisor::new(config).await?;
+    let token_path = write_control_token_file(&sup.config.state_dir, &sup.config.control_token)?;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let local: SocketAddr = listener.local_addr()?;
 

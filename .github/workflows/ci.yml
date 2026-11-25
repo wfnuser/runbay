@@ -11,8 +11,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, backend: bwrap }
+          - { os: ubuntu-latest, backend: landlock }
+          - { os: macos-latest, backend: auto }
     runs-on: ${{ matrix.os }}
+    env:
+      RUNBAY_SANDBOX_BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,14 +26,51 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux sandbox tooling (bubblewrap)
-        if: runner.os == 'Linux'
+      - name: Install and verify bubblewrap
+        if: matrix.backend == 'bwrap'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap curl
-          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get install -y bubblewrap curl apparmor apparmor-profiles
+          probe=(bwrap --unshare-net --unshare-pid --ro-bind / / -- /bin/true)
+          if ! "${probe[@]}"; then
+            for profile in /etc/apparmor.d/{bwrap-userns-restrict,bwrap,bubblewrap} \
+                           /usr/share/apparmor/extra-profiles/{bwrap-userns-restrict,bwrap,bubblewrap}; do
+              if [[ -f "$profile" ]]; then
+                sudo apparmor_parser -r "$profile"
+                break
+              fi
+            done
+            "${probe[@]}"
           fi
+
+      - name: Install the scoped Landlock launcher
+        if: matrix.backend == 'landlock'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl apparmor
+          sudo sh scripts/install-linux-launcher.sh
+
+      - name: Cache the pinned Ubuntu 5.13 kernel package
+        if: matrix.backend == 'landlock'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kernel-5.13.deb
+          key: ubuntu-kernel-eca13c306042c2798cf46849a7bc6633354572f549ecafc44c4a572ab5ac2540
+
+      - name: Boot the minimum Linux kernel with the native launcher
+        if: matrix.backend == 'landlock'
+        run: |
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio
+          deb="$RUNNER_TEMP/kernel-5.13.deb"
+          checksum="eca13c306042c2798cf46849a7bc6633354572f549ecafc44c4a572ab5ac2540  $deb"
+          if ! echo "$checksum" | sha256sum --check --status; then
+            curl --fail --location --retry 3 --output "$deb" \
+              https://old-releases.ubuntu.com/ubuntu/pool/main/l/linux-signed/linux-image-5.13.0-19-generic_5.13.0-19.19_amd64.deb
+          fi
+          echo "$checksum" | sha256sum --check
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/linux-5.13"
+          KERNEL_CC=cc KERNEL_IMAGE="$RUNNER_TEMP/linux-5.13/boot/vmlinuz-5.13.0-19-generic" \
+            sh scripts/test-linux-5.13.sh
 
       - name: Check formatting and Clippy lints
         run: |
@@ -37,6 +79,14 @@ jobs:
 
       - name: Run full workspace unit, OS sandbox, and black-box daemon E2E tests
         run: cargo test --workspace --locked -- --nocapture
+
+      - name: Exercise real per-run cgroup limits in a delegated Linux service
+        if: runner.os == 'Linux'
+        run: |
+          sudo systemd-run --quiet --wait --pipe --collect --uid="$(id -un)" \
+            --working-directory="$PWD" --property=Delegate=yes \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="RUNBAY_SANDBOX_BACKEND=$RUNBAY_SANDBOX_BACKEND" \
+            sh scripts/with-delegated-cgroup.sh cargo test --workspace --locked cgroup -- --ignored --nocapture
 
       - name: Run runbayd self-check
         run: cargo run -p runbayd --locked -- self-check

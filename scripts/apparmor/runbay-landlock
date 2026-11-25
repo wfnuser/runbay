@@ -1,0 +1,26 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Only the root-owned static launcher can enter this profile. The worker's exec
+# stacks an unprivileged profile and the launcher drops its entire capability set.
+profile runbay-landlock /usr/local/libexec/runbay-landlock flags=(attach_disconnected) {
+  allow file rwlkm /{**,},
+  allow capability sys_admin setuid setgid setpcap,
+  allow userns,
+  allow mount,
+  allow umount,
+  allow pivot_root,
+  allow signal,
+  allow unix,
+  allow network,
+  allow px /** -> runbay-landlock//&runbay-worker,
+}
+
+profile runbay-worker flags=(attach_disconnected) {
+  allow file rwlkm /{**,},
+  allow pix /** -> &runbay-worker,
+  allow signal,
+  allow network,
+  allow unix,
+  audit deny capability,
+}

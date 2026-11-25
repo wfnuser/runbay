@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 use auth::generate_csprng_token;
 use runbay_gateway::{MockUpstreamServer, SecretlessLoopbackGateway};
 use runbay_mvcc::{MVCCWorkspaceStore, SharedOutOfSandboxDerivedProxy};
-use runbay_sandbox::{run_os_sandbox_verification_suite, LocalOsSandbox};
+use runbay_sandbox::{run_os_sandbox_verification_suite, LocalOsSandbox, SandboxLimits};
 use runbay_scheduler::{CancelToken, GuardedRunSink};
 use std::collections::BTreeMap;
 use std::fs;
@@ -47,6 +47,10 @@ async fn main() -> Result<()> {
                    --max-concurrent-runs <N>          Max simultaneous live runs (default 4)\n\
                    --max-queued-runs <N>              Max queued runs before 429 (default 32)\n\
                    --default-timeout-secs <N>         Default per-run timeout seconds (default 300)\n\
+                   --sandbox-cgroup-root <DIR>        Delegated Linux cgroup v2 directory for per-run limits\n\
+                   --sandbox-cpu-percent <N>          Per-run ceiling, 100 = one CPU (default 100)\n\
+                   --sandbox-memory-mib <N>           Per-run memory ceiling in MiB (default 256)\n\
+                   --sandbox-max-pids <N>             Per-run process/thread ceiling (default 64)\n\
                    --upstream-url <URL>               Upstream OpenAI-compatible URL for secretless gateway (uses env RUNBAY_UPSTREAM_API_KEY)\n\
                    --codex-bin <PATH>                 Explicit codex executable path\n\
                    --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)",
@@ -66,6 +70,11 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
     let mut max_concurrent_runs: usize = 4;
     let mut max_queued_runs: usize = 32;
     let mut default_timeout_secs: u64 = 300;
+    let mut cgroup_root = std::env::var_os("RUNBAY_CGROUP_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut sandbox_limits = SandboxLimits::default();
+    let mut limits_specified = false;
     let mut allowed_workspace_roots: Vec<PathBuf> = Vec::new();
     let mut upstream_url: Option<String> = std::env::var("RUNBAY_UPSTREAM_URL")
         .ok()
@@ -138,6 +147,25 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
                     .ok_or_else(|| anyhow::anyhow!("--upstream-url requires URL"))?;
                 upstream_url = Some(v.clone());
             }
+            "--sandbox-cgroup-root" => {
+                i += 1;
+                cgroup_root = Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--sandbox-cgroup-root requires a directory")
+                })?));
+            }
+            flag @ ("--sandbox-cpu-percent" | "--sandbox-memory-mib" | "--sandbox-max-pids") => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("{flag} requires a positive integer"))?
+                    .parse()?;
+                match flag {
+                    "--sandbox-cpu-percent" => sandbox_limits.cpu_percent = value,
+                    "--sandbox-memory-mib" => sandbox_limits.memory_mib = value,
+                    _ => sandbox_limits.max_pids = value,
+                }
+                limits_specified = true;
+            }
             "--codex-bin" => {
                 i += 1;
                 let v = args
@@ -153,6 +181,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         i += 1;
     }
 
+    if limits_specified && cgroup_root.is_none() {
+        bail!("sandbox limits require --sandbox-cgroup-root");
+    }
     let state_dir = state_dir.unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -168,6 +199,8 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         max_concurrent_runs,
         max_queued_runs,
         default_timeout_secs,
+        cgroup_root,
+        sandbox_limits,
         allowed_workspace_roots,
         upstream_url,
         upstream_api_key,
@@ -216,20 +249,29 @@ async fn run_self_check() -> Result<()> {
     let gw_ok = resp.status().is_success();
 
     let probe_sb = LocalOsSandbox::new(tmp.path(), &[]);
-    let sb_ok = if probe_sb.is_available() {
-        run_os_sandbox_verification_suite(&tmp.path().join("sb"))?.all_invariants_passed
-    } else {
-        false
+    let sb_ok = match probe_sb.check_available() {
+        Ok(()) => run_os_sandbox_verification_suite(&tmp.path().join("sb"))?.all_invariants_passed,
+        Err(error) => {
+            eprintln!("{error:#}");
+            false
+        }
     };
 
+    let mvcc_ok = rev0_future.hits.is_empty() && !rev1_new.hits.is_empty();
+    let cancel_ok = sink.accepted_count() == 1 && sink.rejected_late_count() == 1;
     let summary = serde_json::json!({
         "runbayd_version": env!("CARGO_PKG_VERSION"),
-        "mvcc_isolation_ok": rev0_future.hits.is_empty() && !rev1_new.hits.is_empty(),
+        "mvcc_isolation_ok": mvcc_ok,
         "incremental_equals_full": eq.exact_equivalence,
-        "cancel_guard_ok": sink.accepted_count() == 1 && sink.rejected_late_count() == 1,
+        "cancel_guard_ok": cancel_ok,
         "secretless_gateway_ok": gw_ok,
+        "sandbox_mechanism": probe_sb.mechanism_name(),
         "os_sandbox_ok": sb_ok
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
+    anyhow::ensure!(
+        sb_ok && gw_ok && eq.exact_equivalence && mvcc_ok && cancel_ok,
+        "runbayd self-check failed"
+    );
     Ok(())
 }

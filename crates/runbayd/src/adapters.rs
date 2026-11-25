@@ -23,7 +23,6 @@ pub struct PreparedLaunch {
     pub sandbox_opts: SandboxRunOptions,
     pub network_isolated: bool,
     pub secretless_gateway: bool,
-    pub gateway_transport: Option<String>,
 }
 
 pub trait RuntimeAdapter: Send + Sync {
@@ -80,7 +79,7 @@ impl RuntimeAdapter for CodexOneShotAdapter {
         let notes = if !available {
             "codex binary not found on host PATH".to_string()
         } else {
-            "One-shot `codex exec --json --ephemeral`. Uses Runbay secretless loopback gateway (--upstream-url + RUNBAY_UPSTREAM_API_KEY) on macOS Seatbelt with zero host credentials inside the sandbox; fails closed on Linux bwrap --unshare-net because codex requires TCP loopback rather than a Unix socket.".to_string()
+            "One-shot `codex exec --json --ephemeral`. Uses Runbay secretless loopback gateway (--upstream-url + RUNBAY_UPSTREAM_API_KEY) on macOS Seatbelt with host credentials kept in the gateway. On Linux the isolated gateway uses a Unix socket and this version of Codex requires TCP loopback.".to_string()
         };
         AdapterCapabilities {
             runtime: "codex".to_string(),
@@ -149,7 +148,7 @@ impl RuntimeAdapter for CodexOneShotAdapter {
         ) {
             if !cfg!(target_os = "macos") {
                 bail!(
-                    "FAIL_CLOSED: codex gateway mode requires TCP loopback access, which Linux bwrap --unshare-net cannot safely restrict without disabling network isolation"
+                    "FAIL_CLOSED: codex gateway mode requires TCP loopback access, which the isolated Linux gateway does not expose"
                 );
             }
             command.push("-c".to_string());
@@ -188,7 +187,6 @@ impl RuntimeAdapter for CodexOneShotAdapter {
                 },
                 network_isolated: true,
                 secretless_gateway: true,
-                gateway_transport: Some("macos_seatbelt_loopback_tcp".to_string()),
             });
         }
 
@@ -200,7 +198,7 @@ impl RuntimeAdapter for CodexOneShotAdapter {
 
 /// Deterministic protocol-fixture adapter (`runtime = "fixture"`), opt-in via
 /// `--enable-fixture-adapter`. Invokes `runbayd __internal-fixture-worker` inside the real
-/// OS sandbox (macOS Seatbelt / Linux bwrap --unshare-net) — cannot execute arbitrary commands.
+/// OS sandbox (macOS Seatbelt or a private Linux network namespace) — cannot execute arbitrary commands.
 pub struct FixtureProtocolAdapter {
     self_binary: PathBuf,
 }
@@ -244,7 +242,6 @@ impl RuntimeAdapter for FixtureProtocolAdapter {
         let mut allowed_loopback_port = None;
         let mut gateway_unix_socket = None;
         let mut secretless_gateway = false;
-        let mut gateway_transport = None;
 
         if let Some(ref tok) = ctx.gateway_run_token {
             env_overrides.insert("OPENAI_API_KEY".to_string(), tok.clone());
@@ -258,7 +255,6 @@ impl RuntimeAdapter for FixtureProtocolAdapter {
                     env_overrides.insert("no_proxy".to_string(), "127.0.0.1,localhost".to_string());
                     allowed_loopback_port = Some(port);
                     secretless_gateway = true;
-                    gateway_transport = Some("macos_seatbelt_loopback_tcp".to_string());
                 }
             } else if let Some(ref sock) = ctx.gateway_unix_socket {
                 env_overrides.insert(
@@ -267,20 +263,10 @@ impl RuntimeAdapter for FixtureProtocolAdapter {
                 );
                 gateway_unix_socket = Some(sock.clone());
                 secretless_gateway = true;
-                gateway_transport = Some("linux_bwrap_unshare_net_unix_socket".to_string());
             } else if ctx.gateway_port.is_some() {
                 bail!(
                     "FAIL_CLOSED: Linux gateway requires a bound gateway_unix_socket under --unshare-net"
                 );
-            }
-        }
-
-        // On Linux bwrap with --ro-bind / /, the compiled test binary is readable at its host
-        // path; pass it as extra_readonly_paths as well in case it resides inside a masked dir.
-        let mut extra_readonly_paths = Vec::new();
-        if let Some(parent) = self.self_binary.parent() {
-            if parent.exists() {
-                extra_readonly_paths.push(parent.to_path_buf());
             }
         }
 
@@ -290,7 +276,7 @@ impl RuntimeAdapter for FixtureProtocolAdapter {
                 "__internal-fixture-worker".to_string(),
             ],
             sandbox_opts: SandboxRunOptions {
-                extra_readonly_paths,
+                extra_readonly_paths: vec![self.self_binary.clone()],
                 extra_writable_paths,
                 allow_network: false,
                 allowed_loopback_port,
@@ -300,7 +286,6 @@ impl RuntimeAdapter for FixtureProtocolAdapter {
             },
             network_isolated: true,
             secretless_gateway,
-            gateway_transport,
         })
     }
 }
