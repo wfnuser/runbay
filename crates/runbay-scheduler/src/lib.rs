@@ -1,8 +1,10 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+pub mod workload;
 
 /// Lock-free atomic cancellation token shared across worker, gateway, and branch tasks.
 #[derive(Debug, Clone, Default)]
@@ -177,6 +179,16 @@ pub struct GuardrailMetrics {
     pub borrowed_dispatches: usize,
 }
 
+/// Per-tenant fairness breakdown (stress benchmark: tenant-skew scenarios).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantMetrics {
+    pub tenant_id: String,
+    pub jobs: usize,
+    pub fg_p95_jct_s: f64,
+    pub bg_max_wait_s: f64,
+    pub starved_jobs_over_45s: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerPolicyReport {
     pub policy: String,
@@ -189,6 +201,7 @@ pub struct SchedulerPolicyReport {
     pub prompt_cache: PromptCacheMetrics,
     pub warm_env_reuse_rate: f64,
     pub guardrail: GuardrailMetrics,
+    pub tenant_breakdown: Vec<TenantMetrics>,
 }
 
 /// Guardrail parameters for `PolicyName::SessionGuardedDual`.
@@ -255,12 +268,12 @@ impl SimConfig {
     }
 }
 
-struct SplitMix64 {
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -272,20 +285,20 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    fn uniform_01(&mut self) -> f64 {
+    pub(crate) fn uniform_01(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64)
     }
 
-    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+    pub(crate) fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.uniform_01()
     }
 
-    fn randint(&mut self, lo: usize, hi_inclusive: usize) -> usize {
+    pub(crate) fn randint(&mut self, lo: usize, hi_inclusive: usize) -> usize {
         let span = (hi_inclusive - lo + 1) as u64;
         lo + (self.next_u64() % span) as usize
     }
 
-    fn expovariate(&mut self, lambda: f64) -> f64 {
+    pub(crate) fn expovariate(&mut self, lambda: f64) -> f64 {
         let u = (1.0 - self.uniform_01()).max(1e-12);
         -u.ln() / lambda
     }
@@ -674,7 +687,9 @@ pub fn simulate_with_config(
         .copied()
         .filter(|o| {
             let j = job_map[o.job_id.as_str()];
-            (j.arrival_s - j.last_cache_hit_s.unwrap_or(0.0)) >= 270.0
+            // TTL-proportional: hot-expiring = age >= 90% of the job's TTL window
+            // (== the original 270s threshold when ttl == 300s).
+            (j.arrival_s - j.last_cache_hit_s.unwrap_or(0.0)) >= 0.9 * j.cache_ttl_s
         })
         .collect();
 
@@ -691,6 +706,34 @@ pub fn simulate_with_config(
 
     let fg_jcts: Vec<f64> = fg.iter().map(|o| o.jct_s).collect();
     let bg_waits: Vec<f64> = bg.iter().map(|o| o.queue_wait_s).collect();
+
+    // Per-tenant fairness breakdown (for tenant-skew stress scenarios).
+    let mut tenant_fg: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    let mut tenant_bg: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    let mut tenant_jobs: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in &outcomes {
+        let tid = job_map[o.job_id.as_str()].tenant_id.as_str();
+        *tenant_jobs.entry(tid).or_insert(0) += 1;
+        if o.priority == JobPriority::Interactive {
+            tenant_fg.entry(tid).or_default().push(o.jct_s);
+        } else {
+            tenant_bg.entry(tid).or_default().push(o.queue_wait_s);
+        }
+    }
+    let tenant_breakdown: Vec<TenantMetrics> = tenant_jobs
+        .iter()
+        .map(|(tid, &n)| {
+            let fg_j = tenant_fg.get(*tid).cloned().unwrap_or_default();
+            let bg_w = tenant_bg.get(*tid).cloned().unwrap_or_default();
+            TenantMetrics {
+                tenant_id: tid.to_string(),
+                jobs: n,
+                fg_p95_jct_s: round_n(percentile(&fg_j, 0.95), 3),
+                bg_max_wait_s: round_n(bg_w.iter().copied().fold(0.0_f64, f64::max), 3),
+                starved_jobs_over_45s: bg_w.iter().filter(|&&w| w > 45.0).count(),
+            }
+        })
+        .collect();
 
     SchedulerPolicyReport {
         policy: policy.as_str().to_string(),
@@ -742,6 +785,7 @@ pub fn simulate_with_config(
             4,
         ),
         guardrail,
+        tenant_breakdown,
     }
 }
 
