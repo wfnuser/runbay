@@ -26,6 +26,14 @@ enum FixtureDirective {
         model: String,
         #[serde(default = "default_true")]
         check_direct_net: bool,
+        /// Full user message sent through the secretless gateway. L2 drives
+        /// shared hot prefixes + varied tails here to generate real
+        /// `cached_tokens` telemetry. Default "ping" keeps e2e behavior.
+        #[serde(default)]
+        content: Option<String>,
+        /// Completion token cap (cost control for L2 probe traffic).
+        #[serde(default)]
+        max_tokens: Option<u64>,
     },
     SleepWithGrandchild {
         #[serde(default = "default_sleep_secs")]
@@ -125,6 +133,8 @@ pub async fn run_fixture_worker() -> Result<()> {
         FixtureDirective::CallGateway {
             model,
             check_direct_net,
+            content,
+            max_tokens,
         } => {
             let direct_net_blocked = if check_direct_net {
                 let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
@@ -140,12 +150,15 @@ pub async fn run_fixture_worker() -> Result<()> {
             let token = env::var("OPENAI_API_KEY")
                 .or_else(|_| env::var("RUNBAY_RUN_TOKEN"))
                 .unwrap_or_default();
-            let body = serde_json::json!({
+            let mut body_json = serde_json::json!({
                 "model": model,
                 "stream": false,
-                "messages": [{"role": "user", "content": "ping"}]
-            })
-            .to_string();
+                "messages": [{"role": "user", "content": content.as_deref().unwrap_or("ping")}]
+            });
+            if let Some(mt) = max_tokens {
+                body_json["max_tokens"] = serde_json::json!(mt);
+            }
+            let body = body_json.to_string();
 
             let response_body = if let Ok(sock) = env::var("RUNBAY_GATEWAY_SOCKET") {
                 #[cfg(unix)]

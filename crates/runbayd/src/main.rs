@@ -1,7 +1,9 @@
 mod adapters;
 mod auth;
+mod dispatcher;
 mod fixture_worker;
 mod models;
+mod runtime_pool;
 mod server;
 mod store;
 mod supervisor;
@@ -51,6 +53,9 @@ async fn main() -> Result<()> {
                    --sandbox-cpu-percent <N>          Per-run ceiling, 100 = one CPU (default 100)\n\
                    --sandbox-memory-mib <N>           Per-run memory ceiling in MiB (default 256)\n\
                    --sandbox-max-pids <N>             Per-run process/thread ceiling (default 64)\n\
+                   --scheduler-mode <shadow|active>   P3b admission mode (default shadow; active=enforced, runtime-switchable via /v1/scheduler/mode)\n\
+                   --reserved-bg-workers <N>          Background-slice reserved workers (default 1)\n\
+                   --min-rescue-prefix-tokens <N>     Rescue floor in est. prompt tokens, bytes/4 (default 10000; 64KB prompt cap = 16k max)\n\
                    --upstream-url <URL>               Upstream OpenAI-compatible URL for secretless gateway (uses env RUNBAY_UPSTREAM_API_KEY)\n\
                    --codex-bin <PATH>                 Explicit codex executable path\n\
                    --enable-fixture-adapter           Opt-in: enable built-in deterministic protocol fixture adapter (for tests/CI)",
@@ -84,6 +89,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         .filter(|s| !s.trim().is_empty());
     let mut enable_fixture_adapter = false;
     let mut codex_bin: Option<PathBuf> = None;
+    let mut scheduler_mode = supervisor::SchedulerMode::Shadow;
+    let mut reserved_bg_workers: usize = 1;
+    let mut min_rescue_prefix_tokens: usize = 10_000;
 
     let mut i = 0;
     while i < args.len() {
@@ -176,6 +184,28 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
             "--enable-fixture-adapter" => {
                 enable_fixture_adapter = true;
             }
+            "--scheduler-mode" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--scheduler-mode requires value"))?;
+                scheduler_mode = supervisor::SchedulerMode::parse(v)
+                    .ok_or_else(|| anyhow::anyhow!("--scheduler-mode must be 'shadow' or 'active'"))?;
+            }
+            "--reserved-bg-workers" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--reserved-bg-workers requires value"))?;
+                reserved_bg_workers = v.parse::<usize>()?.max(1);
+            }
+            "--min-rescue-prefix-tokens" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--min-rescue-prefix-tokens requires value"))?;
+                min_rescue_prefix_tokens = v.parse::<usize>()?;
+            }
             other => bail!("unknown serve flag: {other}"),
         }
         i += 1;
@@ -206,6 +236,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
         upstream_api_key,
         enable_fixture_adapter,
         codex_bin,
+        scheduler_mode,
+        n_reserved_bg_workers: reserved_bg_workers,
+        min_rescue_prefix_tokens,
     })
 }
 

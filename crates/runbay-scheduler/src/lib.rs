@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod cache_table;
+pub mod ledger;
 pub mod workload;
 
 /// Lock-free atomic cancellation token shared across worker, gateway, and branch tasks.
@@ -790,7 +792,7 @@ pub fn simulate_with_config(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn score_job_v2(
+pub fn score_job_v2(
     job: &ScheduledJob,
     now_s: f64,
     worker_session: Option<&str>,

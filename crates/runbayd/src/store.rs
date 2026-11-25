@@ -346,7 +346,8 @@ impl DaemonStore {
     ) -> Result<Option<RunEvent>> {
         let is_lifecycle = matches!(
             event_type,
-            "run.queued" | "run.started" | "run.succeeded" | "run.failed" | "run.cancelled"
+            "run.queued" | "run.deferred" | "run.started" | "run.succeeded" | "run.failed"
+                | "run.cancelled"
         );
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
