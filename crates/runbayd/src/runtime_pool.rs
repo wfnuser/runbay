@@ -13,10 +13,10 @@
 
 use parking_lot::Mutex;
 use runbay_scheduler::cache_table::{CacheStateTable, CallEvent};
-use runbay_scheduler::ledger::{
-    termination_bucket, ActualRow, DecisionLedger, DecisionRow,
+use runbay_scheduler::ledger::{termination_bucket, ActualRow, DecisionLedger, DecisionRow};
+use runbay_scheduler::{
+    score_job_v2, GuardrailConfig, GuardrailMetrics, JobPriority, PolicyName, ScheduledJob,
 };
-use runbay_scheduler::{score_job_v2, GuardrailConfig, GuardrailMetrics, JobPriority, PolicyName, ScheduledJob};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -348,8 +348,7 @@ impl AimdController {
 
         // Hysteresis double-threshold (design §4.4).
         let congested = starve_rate > 0.0 || reject_rate > 0.10 || queue_slope > 0.0;
-        let recovered =
-            starve_rate == 0.0 && reject_rate < 0.02 && queue_slope <= 0.0;
+        let recovered = starve_rate == 0.0 && reject_rate < 0.02 && queue_slope <= 0.0;
 
         if congested {
             self.mode = AimdMode::Congested;
@@ -811,9 +810,7 @@ impl RuntimePoolScheduler {
     /// row keeps `kind:"decision"` so decision→actual joins stay 1:1.
     pub fn log_dispatch(
         &self,
-        run_id: &str,
-        tenant: &str,
-        cluster: &str,
+        meta: &SubmitMeta,
         decision: &str,
         reason: &str,
         score: f64,
@@ -822,9 +819,9 @@ impl RuntimePoolScheduler {
         self.ledger.log_decision(&DecisionRow {
             kind: "dispatch",
             ts: now,
-            run_id: run_id.to_string(),
-            tenant: tenant.to_string(),
-            cluster: cluster.to_string(),
+            run_id: meta.run_id.clone(),
+            tenant: meta.tenant.clone(),
+            cluster: meta.cluster_id.clone(),
             decision: decision.to_string(),
             score,
             rem_ttl_pred: None,
@@ -1204,7 +1201,10 @@ mod tests {
         // abort call at request start 200 → no renewal, rem = 400 - 205 = 195
         p.on_gateway_call("tok_abcdefgh1234567", 40_000, 0, 5_000.0, true, 205.0);
         let rem2 = p.cache.lock().rem_ttl("c_bridge", 205.0).unwrap();
-        assert!((rem2 - 195.0).abs() < 0.5, "abort must not renew: rem={rem2}");
+        assert!(
+            (rem2 - 195.0).abs() < 0.5,
+            "abort must not renew: rem={rem2}"
+        );
     }
 
     #[test]
@@ -1221,17 +1221,26 @@ mod tests {
             3.0,
             1000.0,
         );
-        p.finalize_run("run_5", Some(1002.0), "failed", Some("sandbox_oom_killed"), 1030.0);
-        assert!(p.submits.lock().is_empty());
-        assert_eq!(
-            *p.inflight_by_cluster.lock().get("c_fin").unwrap_or(&0),
-            0
+        p.finalize_run(
+            "run_5",
+            Some(1002.0),
+            "failed",
+            Some("sandbox_oom_killed"),
+            1030.0,
         );
+        assert!(p.submits.lock().is_empty());
+        assert_eq!(*p.inflight_by_cluster.lock().get("c_fin").unwrap_or(&0), 0);
     }
 
     // ---- P3b (design §8.1) ----
 
-    fn cand(run: &str, priority: &str, enq: f64, escalated: bool, defer_until: Option<f64>) -> DispatchCandidate {
+    fn cand(
+        run: &str,
+        priority: &str,
+        enq: f64,
+        escalated: bool,
+        defer_until: Option<f64>,
+    ) -> DispatchCandidate {
         DispatchCandidate {
             meta: meta(run, &format!("c_{run}"), priority, 40_000),
             enqueued_at: enq,
@@ -1249,7 +1258,11 @@ mod tests {
         m.deadline_budget_s = Some(1.0);
         let d = p.evaluate(
             &m,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );
@@ -1259,7 +1272,11 @@ mod tests {
         let m2 = meta("run_b2", "c_b", "interactive", 40_000);
         let d2 = p.evaluate(
             &m2,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );
@@ -1267,17 +1284,27 @@ mod tests {
 
         // Level 3: class default = null → never budget-rejected.
         let dir = std::env::temp_dir().join(format!("rb_pool_budget_{}", std::process::id()));
-        let cfg = ShadowConfig { fg_deadline_budget_s: None, ..Default::default() };
+        let cfg = ShadowConfig {
+            fg_deadline_budget_s: None,
+            ..Default::default()
+        };
         let p2 = RuntimePoolScheduler::open(&dir, cfg).unwrap();
         let mut m3 = meta("run_b3", "c_b", "interactive", 40_000);
         m3.deadline_budget_s = None;
         let d3 = p2.evaluate(
             &m3,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );
-        assert_ne!(d3.reason, "budget_reject", "null budget class must never reject");
+        assert_ne!(
+            d3.reason, "budget_reject",
+            "null budget class must never reject"
+        );
     }
 
     #[test]
@@ -1339,7 +1366,11 @@ mod tests {
             assert!(c <= prev_cap, "cap must never grow during congestion");
             prev_cap = c;
         }
-        assert_eq!(a.cap(), cfg.aimd_min_cap(), "cap floors at min_cap = reserved+1");
+        assert_eq!(
+            a.cap(),
+            cfg.aimd_min_cap(),
+            "cap floors at min_cap = reserved+1"
+        );
         assert_eq!(a.mode(), AimdMode::Congested);
 
         // Recovery: silence + flat queue. Old events age out of the 10s window,
@@ -1395,7 +1426,11 @@ mod tests {
     fn evaluate_is_deterministic_for_replay() {
         let p = pool();
         let m = meta("run_rp", "c_rp", "interactive", 40_000);
-        let depth = QueueDepth { in_flight: 3, queued: 5, deferred: 1 };
+        let depth = QueueDepth {
+            in_flight: 3,
+            queued: 5,
+            deferred: 1,
+        };
         let d1 = p.evaluate(&m, depth, 3.0, 1000.0);
         let d2 = p.evaluate(&m, depth, 3.0, 1000.0);
         assert_eq!(d1.decision, d2.decision);
@@ -1406,7 +1441,11 @@ mod tests {
         // Gate-closed path (in_flight ≥ cap): the Aequitas floor coin is a
         // pure function of run_id — same id, same admit/reject outcome.
         let m2 = meta("run_rp2", "c_rp", "interactive", 40_000);
-        let full = QueueDepth { in_flight: 8, queued: 0, deferred: 0 };
+        let full = QueueDepth {
+            in_flight: 8,
+            queued: 0,
+            deferred: 0,
+        };
         let a1 = p.evaluate(&m2, full, 3.0, 1000.0);
         let a2 = p.evaluate(&m2, full, 3.0, 1000.0);
         assert_eq!(a1.decision, a2.decision);
@@ -1421,11 +1460,18 @@ mod tests {
         m.deadline_budget_s = Some(1.0);
         p.register_submit(
             m,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );
-        assert!(p.submits.lock().is_empty(), "reject must not leak submit state");
+        assert!(
+            p.submits.lock().is_empty(),
+            "reject must not leak submit state"
+        );
         assert_eq!(
             *p.inflight_by_cluster.lock().get("c_rj").unwrap_or(&0),
             0,
@@ -1442,7 +1488,11 @@ mod tests {
         // now=1000: rem_ttl=18 → rescue window → defer (gate closed).
         let d = p2.register_submit(
             m2,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );
@@ -1467,7 +1517,11 @@ mod tests {
         // now=1000: rem_ttl=18 → rescuable regardless of admit/defer.
         let _d = p.register_submit(
             m,
-            QueueDepth { in_flight: 3, queued: 5, deferred: 0 },
+            QueueDepth {
+                in_flight: 3,
+                queued: 5,
+                deferred: 0,
+            },
             3.0,
             1000.0,
         );

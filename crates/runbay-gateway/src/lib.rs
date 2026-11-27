@@ -66,6 +66,8 @@ impl TokenMeta {
     }
 }
 
+type RecordListener = Arc<dyn Fn(&GatewayCallRecord) + Send + Sync>;
+
 struct GatewayInner {
     upstream_base_url: reqwest::Url,
     real_api_key: String,
@@ -75,7 +77,7 @@ struct GatewayInner {
     records: Mutex<Vec<GatewayCallRecord>>,
     /// Optional synchronous listener fired on every pushed record
     /// (P3a TelemetryBridge: feed the scheduler's cache ledger in real time).
-    record_listener: Mutex<Option<Arc<dyn Fn(&GatewayCallRecord) + Send + Sync>>>,
+    record_listener: Mutex<Option<RecordListener>>,
     unauthorized_attempts: AtomicU64,
     next_call_id: AtomicU64,
 }
@@ -972,7 +974,10 @@ mod tests {
         );
         // Cold call (no cache fields at all) -> zero cached tokens.
         let cold = serde_json::json!({"usage": {"prompt_tokens": 100, "completion_tokens": 4}});
-        assert_eq!(extract_usage_from_json(cold.to_string().as_bytes()), (100, 0, 4));
+        assert_eq!(
+            extract_usage_from_json(cold.to_string().as_bytes()),
+            (100, 0, 4)
+        );
     }
 
     #[tokio::test]

@@ -89,8 +89,9 @@ impl DaemonStore {
     ) -> Result<Vec<String>> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT run_id, agent_id FROM runs WHERE state IN ('queued', 'running', 'deferred')")?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, agent_id FROM runs WHERE state IN ('queued', 'running', 'deferred')",
+        )?;
         let rows: Vec<(String, String)> = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -346,7 +347,11 @@ impl DaemonStore {
     ) -> Result<Option<RunEvent>> {
         let is_lifecycle = matches!(
             event_type,
-            "run.queued" | "run.deferred" | "run.started" | "run.succeeded" | "run.failed"
+            "run.queued"
+                | "run.deferred"
+                | "run.started"
+                | "run.succeeded"
+                | "run.failed"
                 | "run.cancelled"
         );
         let now = Utc::now().to_rfc3339();

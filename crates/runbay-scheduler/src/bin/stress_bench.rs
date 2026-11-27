@@ -307,10 +307,12 @@ impl Series {
         self.fg_p99.push(r.foreground.p99_jct_s);
         self.bg_max_wait.push(r.background.max_queue_wait_s);
         self.hit_rate.push(r.prompt_cache.overall_hit_rate);
-        self.cost.push(r.prompt_cache.total_effective_input_cost_units);
+        self.cost
+            .push(r.prompt_cache.total_effective_input_cost_units);
         self.warm_reuse.push(r.warm_env_reuse_rate);
         self.throughput.push(r.throughput_jobs_per_min);
-        self.ceiling_forced.push(r.guardrail.ceiling_forced_dispatches as f64);
+        self.ceiling_forced
+            .push(r.guardrail.ceiling_forced_dispatches as f64);
     }
 
     fn starved_max(&self) -> f64 {
@@ -330,9 +332,7 @@ fn mc(v: &[f64], scale: f64) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let get = |flag: &str| -> Option<String> {
-        args.windows(2)
-            .find(|w| w[0] == flag)
-            .map(|w| w[1].clone())
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
     };
     let n_seeds: usize = get("--seeds").and_then(|s| s.parse().ok()).unwrap_or(20);
     let n_jobs: usize = get("--jobs").and_then(|s| s.parse().ok()).unwrap_or(240);
@@ -347,7 +347,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Measured offered rate per scenario (jobs/min, from actual arrival span).
     let mut offered: BTreeMap<String, f64> = BTreeMap::new();
     // Tenant breakdown snapshot for S7 (last seed, guarded + dual).
-    let mut tenant_snap: BTreeMap<String, Vec<(String, usize, f64, f64, usize)>> = BTreeMap::new();
+    type TenantSnap = BTreeMap<String, Vec<(String, usize, f64, f64, usize)>>;
+    let mut tenant_snap: TenantSnap = BTreeMap::new();
 
     for sc in &scenarios {
         let pol_entry = results.entry(sc.id.clone()).or_default();
@@ -507,11 +508,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "- trace: ttft {}s, decode {}s | aging_cap {}s, min_rescue {} tokens\n",
         TRACE_TTFT_S, TRACE_DECODE_S, AGING_CAP_S, MIN_RESCUE_TOKENS
     ));
-    md.push_str("- semantics: sliding-TTL renewal for all policies; session_guarded_dual + guardrails\n");
+    md.push_str(
+        "- semantics: sliding-TTL renewal for all policies; session_guarded_dual + guardrails\n",
+    );
     md.push_str("- acceptance dual-constraint: rescue rate >= 95% AND starved(>45s) == 0\n\n");
 
     md.push_str("## Scenario matrix\n\n");
-    md.push_str("| id | story | knobs | workers | offered/min (measured) |\n|---|---|---|---|---|\n");
+    md.push_str(
+        "| id | story | knobs | workers | offered/min (measured) |\n|---|---|---|---|---|\n",
+    );
     for sc in &scenarios {
         md.push_str(&format!(
             "| {} | {} | {} | {} | {:.1} |\n",
@@ -593,7 +598,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Verdicts.
-    md.push_str("## Verdicts — max sustainable load (dual-constraint: rescue >= 95% and starved = 0)\n\n");
+    md.push_str(
+        "## Verdicts — max sustainable load (dual-constraint: rescue >= 95% and starved = 0)\n\n",
+    );
     md.push_str("| policy | max sustainable (jobs/min) | cell | first violation (jobs/min) | cell |\n|---|---|---|---|---|\n");
     for p in &POLICIES {
         let v = &verdicts[p.as_str()];
@@ -603,7 +610,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| "—".into())
         };
         let fmtc = |k: &str| -> String {
-            v[k].as_str().map(|s| s.to_string()).unwrap_or_else(|| "—".into())
+            v[k].as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "—".into())
         };
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
@@ -655,7 +664,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {:22} {}", p.as_str(), best);
     }
     println!("\n-- key cells --");
-    for id in ["S0_overload", "S3_hot_expiry_storm", "S5_short_ttl_60", "S4_bg_flood"] {
+    for id in [
+        "S0_overload",
+        "S3_hot_expiry_storm",
+        "S5_short_ttl_60",
+        "S4_bg_flood",
+    ] {
         let pols = &results[id];
         for p in &POLICIES {
             let s = &pols[p.as_str()];

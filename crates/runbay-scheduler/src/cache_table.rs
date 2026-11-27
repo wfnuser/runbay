@@ -123,15 +123,14 @@ impl CacheStateTable {
         let snapshot_path = dir.join("cache_table.snapshot.json");
         let journal_path = dir.join("cache_table.journal.jsonl");
 
-        let mut entries: HashMap<String, ClusterEntry> =
-            if snapshot_path.exists() {
-                let raw = fs::read_to_string(&snapshot_path)?;
-                serde_json::from_str::<Snapshot>(&raw)
-                    .map(|s| s.entries)
-                    .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
+        let mut entries: HashMap<String, ClusterEntry> = if snapshot_path.exists() {
+            let raw = fs::read_to_string(&snapshot_path)?;
+            serde_json::from_str::<Snapshot>(&raw)
+                .map(|s| s.entries)
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
         if journal_path.exists() {
             for line in fs::read_to_string(&journal_path)?.lines() {
@@ -167,9 +166,7 @@ impl CacheStateTable {
 
     /// Remaining TTL at `now`; `None` = unknown cluster, `Some(r ≤ 0)` = cold.
     pub fn rem_ttl(&self, cluster: &str, now: f64) -> Option<f64> {
-        self.entries
-            .get(cluster)
-            .map(|e| e.warm_until() - now)
+        self.entries.get(cluster).map(|e| e.warm_until() - now)
     }
 
     pub fn entry(&self, cluster: &str) -> Option<&ClusterEntry> {
@@ -294,7 +291,9 @@ impl CacheStateTable {
     }
 
     fn journal_append(&mut self, ev: &JournalEvent) {
-        let Some(path) = &self.journal_path else { return };
+        let Some(path) = &self.journal_path else {
+            return;
+        };
         match fs::OpenOptions::new().create(true).append(true).open(path) {
             Ok(mut f) => {
                 if let Ok(line) = serde_json::to_string(ev) {
@@ -319,7 +318,7 @@ impl CacheStateTable {
     }
 
     fn maybe_snapshot(&mut self) {
-        if self.journal_lines == 0 || self.journal_lines % self.cfg.snapshot_every != 0 {
+        if self.journal_lines == 0 || !self.journal_lines.is_multiple_of(self.cfg.snapshot_every) {
             return;
         }
         let (Some(snap), Some(journal)) = (&self.snapshot_path, &self.journal_path) else {
@@ -433,7 +432,11 @@ mod tests {
 
         // below cacheable floor → activity only
         t.on_call("c1", "t1", 1, &ev(300.0, 10, 0, false), 301.0);
-        assert_eq!(t.rem_ttl("c1", 301.0), Some(249.0), "below-floor must not renew");
+        assert_eq!(
+            t.rem_ttl("c1", 301.0),
+            Some(249.0),
+            "below-floor must not renew"
+        );
     }
 
     #[test]
@@ -483,7 +486,10 @@ mod tests {
         // Past warm_until + 2×ttl = 400 + 600 = 1000.
         t.gc(1001.0);
         let e = t.entry("c1").unwrap();
-        assert_eq!(e.prefix_tokens, 40_000, "prefix_tokens is stable, not warmth");
+        assert_eq!(
+            e.prefix_tokens, 40_000,
+            "prefix_tokens is stable, not warmth"
+        );
         assert_eq!(e.hits, 0, "warm-era hit history reset");
         assert_eq!(e.misses, 0, "warm-era miss history reset");
     }
@@ -496,7 +502,13 @@ mod tests {
 
         {
             let mut t = CacheStateTable::open(&dir, CacheTableConfig::default()).unwrap();
-            t.on_call("c1", "t1", 1, &ev(unix_now() - 1000.0, 2000, 0, false), unix_now() - 990.0);
+            t.on_call(
+                "c1",
+                "t1",
+                1,
+                &ev(unix_now() - 1000.0, 2000, 0, false),
+                unix_now() - 990.0,
+            );
         }
         // reopen: entry restored but warm_until long past → cold
         let t = CacheStateTable::open(&dir, CacheTableConfig::default()).unwrap();

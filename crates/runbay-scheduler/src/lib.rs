@@ -540,7 +540,9 @@ pub fn simulate_with_config(
 
         // Reserved background slice: a reserved worker must serve background jobs when
         // any are pending (work-conserving: otherwise it borrows shared work).
-        let bg_pending = pending.iter().any(|j| j.priority == JobPriority::Background);
+        let bg_pending = pending
+            .iter()
+            .any(|j| j.priority == JobPriority::Background);
         let restricted_to_bg = guarded && workers[w_idx].reserved_bg && bg_pending;
 
         let chosen_idx = if policy == PolicyName::Fifo {
@@ -643,7 +645,9 @@ pub fn simulate_with_config(
         // P0 sliding-TTL renewal write-back: every run (hit or miss) refreshes the
         // session prefix cluster's last touch — a hit renews the whole cluster.
         if cfg.renew_ttl_on_hit {
-            let entry = lineage_last_hit.entry(job.session_id.clone()).or_insert(0.0);
+            let entry = lineage_last_hit
+                .entry(job.session_id.clone())
+                .or_insert(0.0);
             if llm_start_s > *entry {
                 *entry = llm_start_s;
             }
@@ -845,15 +849,14 @@ pub fn score_job_v2(
                 && r <= ttl_rescue_window_s
                 && job.prefix_tokens >= min_rescue_prefix_tokens);
             let affinity_ok = !cache_urgent || wait < gcfg.break_affinity_wait_s;
-            if affinity_ok {
-                if worker_tenant == Some(job.tenant_id.as_str()) && worker_rev.is_some() {
-                    score += gcfg.tenant_affinity_bonus;
-                    if worker_rev == Some(job.required_rev) {
-                        score += gcfg.tenant_rev_affinity_bonus;
-                    }
-                    if worker_session == Some(job.session_id.as_str()) {
-                        score += gcfg.session_affinity_bonus;
-                    }
+            if affinity_ok && worker_tenant == Some(job.tenant_id.as_str()) && worker_rev.is_some()
+            {
+                score += gcfg.tenant_affinity_bonus;
+                if worker_rev == Some(job.required_rev) {
+                    score += gcfg.tenant_rev_affinity_bonus;
+                }
+                if worker_session == Some(job.session_id.as_str()) {
+                    score += gcfg.session_affinity_bonus;
                 }
             }
         }

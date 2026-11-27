@@ -14,7 +14,7 @@
 //! Verdict gates (B4 four-way accounting; sample floor ≥30 per prediction
 //! side):
 //! - `PASS`  : overestimation share ≤ 5% and Wilson upper ≤ 15% and
-//!             hit-rate diff CI upper ≤ 5pp;
+//!   hit-rate diff CI upper ≤ 5pp;
 //! - `WARN`  : share ≤ 10% and diff CI upper ≤ 10pp;
 //! - `FAIL`  : otherwise — do NOT enable P3b Active.
 //!
@@ -129,7 +129,11 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
         };
         match v.get("kind").and_then(|k| k.as_str()) {
             Some("decision") => {
-                let run_id = v.get("run_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let run_id = v
+                    .get("run_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if run_id.is_empty() {
                     continue;
                 }
@@ -149,7 +153,11 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
                 );
             }
             Some("actual") => {
-                let run_id = v.get("run_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let run_id = v
+                    .get("run_id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if run_id.is_empty() {
                     continue;
                 }
@@ -158,9 +166,18 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
                     ActualRec {
                         queue_wait_actual: f64_field(&v, "queue_wait_actual"),
                         service_actual: f64_field(&v, "service_actual"),
-                        cached_tokens: v.get("cached_tokens_sum").and_then(|x| x.as_u64()).unwrap_or(0),
-                        prompt_tokens: v.get("prompt_tokens_sum").and_then(|x| x.as_u64()).unwrap_or(0),
-                        hit: v.get("actual_hit").and_then(|x| x.as_bool()).unwrap_or(false),
+                        cached_tokens: v
+                            .get("cached_tokens_sum")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        prompt_tokens: v
+                            .get("prompt_tokens_sum")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0),
+                        hit: v
+                            .get("actual_hit")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                         termination: v
                             .get("termination")
                             .and_then(|x| x.as_str())
@@ -234,7 +251,10 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
             } else {
                 d.cluster.clone()
             };
-            per_cluster.entry(key).or_default().push((d.ts, warm, a.hit));
+            per_cluster
+                .entry(key)
+                .or_default()
+                .push((d.ts, warm, a.hit));
             time_series.push((d.ts, warm, a.hit));
         }
     }
@@ -256,7 +276,11 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
         (mean, (mean - 1.96 * se, mean + 1.96 * se))
     };
 
-    let over_share = if n_warm > 0 { q_hm as f64 / n_warm as f64 } else { 0.0 };
+    let over_share = if n_warm > 0 {
+        q_hm as f64 / n_warm as f64
+    } else {
+        0.0
+    };
     let over_wilson_upper = wilson_upper(q_hm, n_warm, 1.96);
     let token_ratio_warm_p50 = quantiles(warm_token_ratios.clone()).1;
     let cache_hit_token_ratio = if total_prompt_tokens > 0 {
@@ -329,16 +353,18 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
             let mut n_warm = 0usize;
             let mut n_over = 0usize;
             for &(ts, warm, hit) in &time_series {
-                if ts >= lo && ts < hi {
-                    if warm {
-                        n_warm += 1;
-                        if !hit {
-                            n_over += 1;
-                        }
+                if ts >= lo && ts < hi && warm {
+                    n_warm += 1;
+                    if !hit {
+                        n_over += 1;
                     }
                 }
             }
-            let over_share = if n_warm > 0 { n_over as f64 / n_warm as f64 } else { 0.0 };
+            let over_share = if n_warm > 0 {
+                n_over as f64 / n_warm as f64
+            } else {
+                0.0
+            };
             // Only compare epochs with a meaningful sample (>= 10 warm).
             if e == n_epochs - 1 && n_warm >= 10 && over_share > prev_max_over + 0.15 {
                 drift_detected = true;
@@ -353,7 +379,7 @@ pub fn run_recon(jsonl: &Path) -> std::io::Result<ReconReport> {
     let est_service_residual = quantiles(service_res);
     let est_wait_residual = quantiles(wait_res);
     let mut terminations: Vec<(String, usize)> = term_counts.into_iter().collect();
-    terminations.sort_by(|a, b| b.1.cmp(&a.1));
+    terminations.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let verdict = if n_warm < 30 || n_miss < 30 {
         "INSUFFICIENT_DATA — need >=30 predicted-warm and >=30 predicted-miss completed (exit) samples"
@@ -436,11 +462,17 @@ pub fn render_markdown(r: &ReconReport) -> String {
         r.total_cached_tokens,
         r.total_prompt_tokens,
         pct(r.cache_hit_token_ratio),
-        if r.total_cached_tokens > 0 { "positive" } else { "zero" }
+        if r.total_cached_tokens > 0 {
+            "positive"
+        } else {
+            "zero"
+        }
     ));
 
     md.push_str("## 2. Per-cluster gap buckets (TTL drift readout)\n\n");
-    md.push_str("| gap to prev run | n | actual hit rate | predicted-warm rate |\n|---|---|---|---|\n");
+    md.push_str(
+        "| gap to prev run | n | actual hit rate | predicted-warm rate |\n|---|---|---|---|\n",
+    );
     for (label, n, hit_rate, warm_rate) in &r.gap_buckets {
         md.push_str(&format!(
             "| {label} | {n} | {} | {} |\n",
@@ -453,9 +485,16 @@ pub fn render_markdown(r: &ReconReport) -> String {
     );
 
     md.push_str("## 3. Estimator residuals (P5 calibration input)\n\n");
-    let fmt3 = |t: (f64, f64, f64)| format!("mean {:+.2}s, p50 {:+.2}s, p90 {:+.2}s", t.0, t.1, t.2);
-    md.push_str(&format!("- `est_service` residual (actual−pred): {}\n", fmt3(r.est_service_residual)));
-    md.push_str(&format!("- `est_wait` residual (actual−pred): {}\n\n", fmt3(r.est_wait_residual)));
+    let fmt3 =
+        |t: (f64, f64, f64)| format!("mean {:+.2}s, p50 {:+.2}s, p90 {:+.2}s", t.0, t.1, t.2);
+    md.push_str(&format!(
+        "- `est_service` residual (actual−pred): {}\n",
+        fmt3(r.est_service_residual)
+    ));
+    md.push_str(&format!(
+        "- `est_wait` residual (actual−pred): {}\n\n",
+        fmt3(r.est_wait_residual)
+    ));
 
     md.push_str("## 4. Termination attribution\n\n");
     for (t, n) in &r.terminations {
@@ -465,7 +504,11 @@ pub fn render_markdown(r: &ReconReport) -> String {
     md.push_str("## 5. TTL-drift change-point detection (P4)\n\n");
     md.push_str(&format!(
         "Drift flag: {}\n",
-        if r.drift_detected { "DETECTED — provider TTL semantics may have changed" } else { "none" }
+        if r.drift_detected {
+            "DETECTED — provider TTL semantics may have changed"
+        } else {
+            "none"
+        }
     ));
     md.push_str("| epoch start | n warm | overestimation share |\n|---|---|---|\n");
     for (lo, n, over) in &r.drift_buckets {
@@ -540,7 +583,10 @@ fn main() {
             let md = render_markdown(&report);
             println!("{md}");
             let out = jsonl.with_file_name("recon_report.json");
-            let _ = std::fs::write(&out, serde_json::to_string_pretty(&report_json(&report)).unwrap());
+            let _ = std::fs::write(
+                &out,
+                serde_json::to_string_pretty(&report_json(&report)).unwrap(),
+            );
             eprintln!("bench_recon: JSON report -> {}", out.display());
         }
         Err(e) => {
@@ -560,7 +606,14 @@ mod tests {
         std::fs::write(&file, rows.join("\n")).unwrap();
     }
 
-    fn row(kind: &str, run: &str, cluster: &str, warm: Option<f64>, hit: bool, tokens: u64) -> String {
+    fn row(
+        kind: &str,
+        run: &str,
+        cluster: &str,
+        warm: Option<f64>,
+        hit: bool,
+        tokens: u64,
+    ) -> String {
         if kind == "decision" {
             serde_json::json!({
                 "kind": "decision", "ts": 1000.0, "run_id": run, "tenant": "t", "cluster": cluster,
@@ -586,8 +639,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut rows = Vec::new();
         for i in 0..35 {
-            rows.push(row("decision", &format!("r{i}"), "c1", Some(20.0), true, 4000));
-            rows.push(row("actual", &format!("r{i}"), "c1", Some(20.0), true, 4000));
+            rows.push(row(
+                "decision",
+                &format!("r{i}"),
+                "c1",
+                Some(20.0),
+                true,
+                4000,
+            ));
+            rows.push(row(
+                "actual",
+                &format!("r{i}"),
+                "c1",
+                Some(20.0),
+                true,
+                4000,
+            ));
         }
         for i in 35..70 {
             rows.push(row("decision", &format!("r{i}"), "c1", None, true, 4000));
@@ -611,7 +678,14 @@ mod tests {
         let mut rows = Vec::new();
         for i in 0..35 {
             let hit = i % 7 != 0; // 30 hits, 5 misses among predicted-warm
-            rows.push(row("decision", &format!("r{i}"), "c1", Some(20.0), hit, 4000));
+            rows.push(row(
+                "decision",
+                &format!("r{i}"),
+                "c1",
+                Some(20.0),
+                hit,
+                4000,
+            ));
             rows.push(row("actual", &format!("r{i}"), "c1", Some(20.0), hit, 4000));
         }
         for i in 35..70 {
@@ -637,7 +711,11 @@ mod tests {
         ];
         write_rows(&dir, &rows);
         let r = run_recon(&dir.join("scheduler").join("decisions.jsonl")).unwrap();
-        assert!(r.verdict.starts_with("INSUFFICIENT"), "verdict = {}", r.verdict);
+        assert!(
+            r.verdict.starts_with("INSUFFICIENT"),
+            "verdict = {}",
+            r.verdict
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -650,7 +728,14 @@ mod tests {
         let mut rows = Vec::new();
         for i in 0..35 {
             let cancelled = i >= 30;
-            rows.push(row("decision", &format!("r{i}"), "c1", Some(20.0), !cancelled, 4000));
+            rows.push(row(
+                "decision",
+                &format!("r{i}"),
+                "c1",
+                Some(20.0),
+                !cancelled,
+                4000,
+            ));
             if cancelled {
                 rows.push(serde_json::json!({
                     "kind": "actual", "ts": 1010.0, "run_id": format!("r{i}"), "tenant": "t", "cluster": "c1",
@@ -659,7 +744,14 @@ mod tests {
                     "actual_hit": false, "termination": "cancelled"
                 }).to_string());
             } else {
-                rows.push(row("actual", &format!("r{i}"), "c1", Some(20.0), true, 4000));
+                rows.push(row(
+                    "actual",
+                    &format!("r{i}"),
+                    "c1",
+                    Some(20.0),
+                    true,
+                    4000,
+                ));
             }
         }
         for i in 35..70 {
@@ -670,7 +762,10 @@ mod tests {
         let r = run_recon(&dir.join("scheduler").join("decisions.jsonl")).unwrap();
         assert_eq!(r.n_joined, 70);
         assert_eq!(r.n_excluded_non_exit, 5);
-        assert_eq!(r.q_hit_miss, 0, "cancelled runs must not count as overestimation");
+        assert_eq!(
+            r.q_hit_miss, 0,
+            "cancelled runs must not count as overestimation"
+        );
         assert_eq!(r.n_pred_warm, 30, "only exit warm runs count toward A1");
         assert!(r.verdict.starts_with("PASS"), "verdict = {}", r.verdict);
         let _ = std::fs::remove_dir_all(&dir);

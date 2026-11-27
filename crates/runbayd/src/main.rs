@@ -189,8 +189,9 @@ fn parse_serve_args(args: &[String]) -> Result<DaemonConfig> {
                 let v = args
                     .get(i)
                     .ok_or_else(|| anyhow::anyhow!("--scheduler-mode requires value"))?;
-                scheduler_mode = supervisor::SchedulerMode::parse(v)
-                    .ok_or_else(|| anyhow::anyhow!("--scheduler-mode must be 'shadow' or 'active'"))?;
+                scheduler_mode = supervisor::SchedulerMode::parse(v).ok_or_else(|| {
+                    anyhow::anyhow!("--scheduler-mode must be 'shadow' or 'active'")
+                })?;
             }
             "--reserved-bg-workers" => {
                 i += 1;

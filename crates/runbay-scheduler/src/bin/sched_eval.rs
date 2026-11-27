@@ -75,12 +75,12 @@ struct MetricSeries {
 impl MetricSeries {
     fn push(&mut self, r: &SchedulerPolicyReport) {
         self.rescue_rate.push(r.prompt_cache.expiring_hot_hit_rate);
-        self.starved
-            .push(r.background.starved_jobs_over_45s as f64);
+        self.starved.push(r.background.starved_jobs_over_45s as f64);
         self.fg_p95_jct.push(r.foreground.p95_jct_s);
         self.bg_max_wait.push(r.background.max_queue_wait_s);
         self.hit_rate.push(r.prompt_cache.overall_hit_rate);
-        self.cost.push(r.prompt_cache.total_effective_input_cost_units);
+        self.cost
+            .push(r.prompt_cache.total_effective_input_cost_units);
         self.warm_reuse.push(r.warm_env_reuse_rate);
         self.throughput.push(r.throughput_jobs_per_min);
         self.ceiling_forced
@@ -89,19 +89,13 @@ impl MetricSeries {
 }
 
 fn fmt_mc(v: &[f64], scale: f64) -> String {
-    format!(
-        "{:.3} ± {:.3}",
-        mean(v) * scale,
-        ci95(v) * scale
-    )
+    format!("{:.3} ± {:.3}", mean(v) * scale, ci95(v) * scale)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let get = |flag: &str| -> Option<String> {
-        args.windows(2)
-            .find(|w| w[0] == flag)
-            .map(|w| w[1].clone())
+        args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
     };
     let n_seeds: usize = get("--seeds").and_then(|s| s.parse().ok()).unwrap_or(20);
     let n_jobs: usize = get("--jobs").and_then(|s| s.parse().ok()).unwrap_or(120);
@@ -138,42 +132,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (regime_name, overload) in regimes {
         let reg_entry = results.entry(regime_name).or_default();
 
-        let mut run = |semantics: &str, cfg: SimConfig, policies: &[PolicyName], series_sink: &mut BTreeMap<String, BTreeMap<String, MetricSeries>>| {
-            let sem_entry = series_sink.entry(semantics.to_string()).or_default();
-            for &p in policies {
-                let s = sem_entry.entry(p.as_str().to_string()).or_default();
-                for i in 0..n_seeds {
-                    let jobs = generate_rate_limited_workload(
-                        base_seed + i as u64,
-                        n_jobs,
-                        overload,
-                        TRACE_TTFT_S,
-                        TRACE_DECODE_S,
-                    );
-                    let r = simulate_with_config(
-                        &jobs,
-                        p,
-                        N_WORKERS,
-                        AGING_CAP_S,
-                        RESCUE_WINDOW_S,
-                        MIN_RESCUE_TOKENS,
-                        &cfg,
-                    );
-                    if regime_name == "overload"
-                        && p == guarded
-                        && semantics == "renewal_guarded"
-                    {
-                        acceptance_rescue.push(r.prompt_cache.expiring_hot_hit_rate);
-                        acceptance_starved
-                            .push(r.background.starved_jobs_over_45s as f64);
+        let mut run =
+            |semantics: &str,
+             cfg: SimConfig,
+             policies: &[PolicyName],
+             series_sink: &mut BTreeMap<String, BTreeMap<String, MetricSeries>>| {
+                let sem_entry = series_sink.entry(semantics.to_string()).or_default();
+                for &p in policies {
+                    let s = sem_entry.entry(p.as_str().to_string()).or_default();
+                    for i in 0..n_seeds {
+                        let jobs = generate_rate_limited_workload(
+                            base_seed + i as u64,
+                            n_jobs,
+                            overload,
+                            TRACE_TTFT_S,
+                            TRACE_DECODE_S,
+                        );
+                        let r = simulate_with_config(
+                            &jobs,
+                            p,
+                            N_WORKERS,
+                            AGING_CAP_S,
+                            RESCUE_WINDOW_S,
+                            MIN_RESCUE_TOKENS,
+                            &cfg,
+                        );
+                        if regime_name == "overload"
+                            && p == guarded
+                            && semantics == "renewal_guarded"
+                        {
+                            acceptance_rescue.push(r.prompt_cache.expiring_hot_hit_rate);
+                            acceptance_starved.push(r.background.starved_jobs_over_45s as f64);
+                        }
+                        s.push(&r);
                     }
-                    s.push(&r);
                 }
-            }
-        };
+            };
 
         run("legacy", SimConfig::legacy(), &all_legacy, reg_entry);
-        run("renewal", SimConfig::renewal(), &all_renewal[..4], reg_entry);
+        run(
+            "renewal",
+            SimConfig::renewal(),
+            &all_renewal[..4],
+            reg_entry,
+        );
         run(
             "renewal_guarded",
             SimConfig::renewal_guarded(),
@@ -321,7 +323,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- stdout summary ----
     println!("=== sched_eval complete ===");
-    println!("seeds={} jobs={} | json: {} | md: {}", n_seeds, n_jobs, out_path, md_path);
+    println!(
+        "seeds={} jobs={} | json: {} | md: {}",
+        n_seeds, n_jobs, out_path, md_path
+    );
     println!(
         "acceptance: rescue {:.1}% (>=95%) | starved max {:.0} (=0) => {}",
         rescue_mean * 100.0,

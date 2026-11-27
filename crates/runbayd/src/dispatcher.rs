@@ -94,12 +94,18 @@ impl DispatchQueue {
 
     /// Queued (not deferred) depth.
     pub fn queued_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.defer_until.is_none()).count()
+        self.entries
+            .iter()
+            .filter(|e| e.defer_until.is_none())
+            .count()
     }
 
     /// Deferred depth (design B3: combined quota with queued).
     pub fn deferred_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.defer_until.is_some()).count()
+        self.entries
+            .iter()
+            .filter(|e| e.defer_until.is_some())
+            .count()
     }
 
     /// Mark deferred entries whose deadline has passed as escalated. Returns
@@ -154,7 +160,10 @@ impl DispatchQueue {
 
     /// Whether the given slot is reserved for the background slice.
     pub fn slot_reserved_bg(&self, slot_id: usize) -> bool {
-        self.slots.get(slot_id).map(|s| s.reserved_bg).unwrap_or(false)
+        self.slots
+            .get(slot_id)
+            .map(|s| s.reserved_bg)
+            .unwrap_or(false)
     }
 
     /// Count of busy slots currently running a background job. Used by tests
@@ -289,7 +298,11 @@ mod tests {
         q.release(slot);
         assert_eq!(q.bg_running(), 0, "released slot must not count as running");
         let ctx = q.slot_ctx(slot);
-        assert_eq!(ctx.tenant.as_deref(), Some("t1"), "affinity kept after release");
+        assert_eq!(
+            ctx.tenant.as_deref(),
+            Some("t1"),
+            "affinity kept after release"
+        );
         assert_eq!(ctx.rev, Some(1));
         assert_eq!(ctx.session.as_deref(), Some("c_r1"));
         assert_eq!(q.free_slot_count(), 2);

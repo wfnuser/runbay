@@ -3,12 +3,14 @@ use crate::auth::{
     generate_csprng_token, validate_identifier, validate_workspace_dir, MAX_PROMPT_BYTES,
     MAX_TIMEOUT_SECS,
 };
+use crate::dispatcher::{DispatchEntry, DispatchQueue, DispatchTicket, SlotGuard};
 use crate::models::{
     AgentRecord, AgentStatusView, CapabilityTier, DaemonStatusResponse, RegisterAgentRequest,
     RunEvent, RunRecord, RunState, SubmitRunRequest,
 };
-use crate::dispatcher::{DispatchEntry, DispatchQueue, DispatchTicket, SlotGuard};
-use crate::runtime_pool::{cluster_key, QueueDepth, RuntimePoolScheduler, ShadowConfig, SubmitMeta};
+use crate::runtime_pool::{
+    cluster_key, QueueDepth, RuntimePoolScheduler, ShadowConfig, SubmitMeta,
+};
 use crate::store::DaemonStore;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -612,7 +614,9 @@ impl DaemonSupervisor {
         } else {
             self.config.max_concurrent_runs as f64
         };
-        let decision = self.runtime_pool.register_submit(meta.clone(), depth, cap, now);
+        let decision = self
+            .runtime_pool
+            .register_submit(meta.clone(), depth, cap, now);
 
         if active_mode && decision.decision == "reject" {
             drop(queue_guard);
@@ -1354,9 +1358,7 @@ impl DaemonSupervisor {
 
             // Dispatch-time ledger row (`kind:"dispatch"`; joins stay 1:1).
             self.runtime_pool.log_dispatch(
-                &entry.meta.run_id,
-                &entry.meta.tenant,
-                &entry.meta.cluster_id,
+                &entry.meta,
                 if entry.escalated { "forced" } else { "admit" },
                 reason,
                 score,

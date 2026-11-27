@@ -230,10 +230,19 @@ mod tests {
     #[test]
     fn termination_buckets() {
         assert_eq!(termination_bucket("succeeded", None), "exit");
-        assert_eq!(termination_bucket("cancelled", Some("cancelled_while_queued")), "cancelled");
-        assert_eq!(termination_bucket("failed", Some("timeout_exceeded")), "timeout");
+        assert_eq!(
+            termination_bucket("cancelled", Some("cancelled_while_queued")),
+            "cancelled"
+        );
+        assert_eq!(
+            termination_bucket("failed", Some("timeout_exceeded")),
+            "timeout"
+        );
         assert_eq!(termination_bucket("failed", Some("spawn_failed")), "failed");
-        assert_eq!(termination_bucket("failed", Some("sandbox_oom_killed")), "oom_killed");
+        assert_eq!(
+            termination_bucket("failed", Some("sandbox_oom_killed")),
+            "oom_killed"
+        );
     }
 
     // Regression: concurrent `log_decision`/`log_actual` must never interleave a
