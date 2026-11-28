@@ -15,6 +15,274 @@ struct SpawnedDaemon {
     _state_dir_path: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn test_native_outcomes_survive_large_events_and_successful_retries() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = MockUpstreamServer::start().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let failed = serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"x".repeat(12000)}],"stopReason":"length"}});
+    let success = serde_json::json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop"}});
+    let cases = [
+        ("pi", vec![failed.clone()], "failed"),
+        (
+            "pi",
+            vec![
+                serde_json::json!({"type":"message_end","message":{"role":"assistant","stopReason":"aborted"}}),
+            ],
+            "failed",
+        ),
+        (
+            "pi",
+            vec![
+                serde_json::json!({"type":"message_end","message":{"role":"assistant","stopReason":"error"}}),
+            ],
+            "failed",
+        ),
+        ("pi", vec![failed, success], "succeeded"),
+        ("pi", vec![serde_json::json!({"type":"session"})], "failed"),
+        (
+            "claude",
+            vec![
+                serde_json::json!({"type":"result","subtype":"error_during_execution","is_error":true}),
+            ],
+            "failed",
+        ),
+    ];
+    for (index, (runtime, events, expected)) in cases.into_iter().enumerate() {
+        // Model only the external CLI protocol; exercise real supervisor, sandbox, and SSE.
+        let cli = tmp.path().join(format!("fake-cli-{index}"));
+        let mut script = "#!/bin/sh\n".to_string();
+        for event in events {
+            script.push_str(&format!("printf '%s\\n' '{}'\n", event));
+        }
+        fs::write(&cli, script).unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        let override_name = if runtime == "pi" {
+            "RUNBAY_PI_BIN"
+        } else {
+            "RUNBAY_CLAUDE_BIN"
+        };
+        let daemon = SpawnedDaemon::spawn(
+            &tmp.path().join(format!("state-{index}")),
+            "rb_ctl_outcomes",
+            &[
+                "--allow-workspace-root",
+                ws.to_str().unwrap(),
+                "--upstream-url",
+                &mock.base_url(),
+            ],
+            &[
+                ("RUNBAY_UPSTREAM_API_KEY", "host-only-test-key"),
+                (override_name, cli.to_str().unwrap()),
+            ],
+        );
+        let client = reqwest::Client::new();
+        let register = client.post(format!("{}/agents", daemon.base_url)).bearer_auth(&daemon.token)
+            .json(&serde_json::json!({"agent_id":"outcome-test","runtime":runtime,"workspace_dir":ws}))
+            .send().await.unwrap();
+        assert_eq!(register.status(), 201);
+        let run: serde_json::Value = client
+            .post(format!("{}/agents/outcome-test/run", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({"prompt":"test","allowed_model":"test-model"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = collect_run_sse(&client, &daemon, run["run_id"].as_str().unwrap(), None).await;
+        let final_run = wait_for_run_state(
+            &client,
+            &daemon,
+            run["run_id"].as_str().unwrap(),
+            &["succeeded", "failed"],
+        )
+        .await;
+        assert_eq!(final_run["state"], expected, "case {index}");
+        assert_eq!(final_run["exit_code"], 0);
+        if expected == "failed" {
+            assert_eq!(final_run["error_code"], "runtime_reported_error");
+        }
+        assert!(events.iter().any(|e| e.event == format!("run.{expected}")));
+    }
+}
+
+// Real installed CLIs, real daemon and OS sandbox; only the paid model is replaced.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_real_claude_and_pi_via_anthropic_gateway_when_installed() {
+    use bytes::Bytes;
+    use http::{Request, Response};
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let path = req.uri().path().to_string();
+                        let key = req
+                            .headers()
+                            .get("x-api-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if body.to_string().contains("FORCE_UPSTREAM_AUTH_ERROR") {
+                            return Ok::<_, Infallible>(Response::builder().status(401)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from_static(br#"{"type":"error","error":{"type":"authentication_error","message":"synthetic credential rejection"}}"#))).unwrap());
+                        }
+                        seen.lock().unwrap().push((path, key, body));
+                        let events = [
+                            serde_json::json!({"type":"message_start","message":{"id":"msg_runbay","type":"message","role":"assistant","content":[],"model":"test-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
+                            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"RUNBAY_CLI_OK"}}),
+                            serde_json::json!({"type":"content_block_stop","index":0}),
+                            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":8}}),
+                            serde_json::json!({"type":"message_stop"}),
+                        ];
+                        let data: String = events
+                            .iter()
+                            .map(|v| {
+                                format!("event: {}\ndata: {}\n\n", v["type"].as_str().unwrap(), v)
+                            })
+                            .collect();
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(Full::new(Bytes::from(data)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("workspace");
+    fs::create_dir_all(&ws).unwrap();
+    let daemon = SpawnedDaemon::spawn(
+        &tmp.path().join("state"),
+        "rb_ctl_claude_pi_test",
+        &[
+            "--allow-workspace-root",
+            ws.to_str().unwrap(),
+            "--upstream-url",
+            &upstream,
+        ],
+        &[("RUNBAY_UPSTREAM_API_KEY", "host-test-secret")],
+    );
+    let client = reqwest::Client::new();
+    let status: serde_json::Value = client
+        .get(format!("{}/v1/status", daemon.base_url))
+        .bearer_auth(&daemon.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for runtime in ["claude", "pi"] {
+        if status["adapters"][runtime]["available"] != true {
+            eprintln!("SKIP real {runtime}: CLI not installed");
+            continue;
+        }
+        let reg = client
+            .post(format!("{}/agents", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({"agent_id":runtime,"runtime":runtime,"workspace_dir":ws}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reg.status(), 201);
+        let run = client.post(format!("{}/agents/{runtime}/run", daemon.base_url)).bearer_auth(&daemon.token)
+            .json(&serde_json::json!({"prompt":"Say RUNBAY_CLI_OK only","allowed_model":"test-model","timeout_secs":30}))
+            .send().await.unwrap();
+        assert_eq!(run.status(), 202);
+        let run: serde_json::Value = run.json().await.unwrap();
+        let run_id = run["run_id"].as_str().unwrap();
+        let events = collect_run_sse(&client, &daemon, run_id, None).await;
+        let result: serde_json::Value = client
+            .get(format!("{}/runs/{run_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            result["state"], "succeeded",
+            "{runtime}: {result} {events:?}"
+        );
+        for field in ["sandbox_enforced", "network_isolated", "secretless_gateway"] {
+            assert_eq!(result[field], true, "{runtime}: {field}");
+        }
+        let output = format!("{events:?}");
+        assert!(
+            output.contains("RUNBAY_CLI_OK"),
+            "{runtime}: no answer: {output}"
+        );
+        assert!(!output.contains("host-test-secret"));
+        {
+            let mut seen = requests.lock().unwrap();
+            assert!(!seen.is_empty(), "real CLI must call the gateway");
+            for (path, key, body) in seen.iter() {
+                assert_eq!(path, "/v1/messages");
+                assert_eq!(key, "host-test-secret");
+                assert_eq!(body["model"], "test-model");
+                assert!(body.get("stream_options").is_none());
+            }
+            seen.clear();
+        }
+
+        if runtime != "pi" {
+            continue;
+        }
+
+        let rejected: serde_json::Value = client
+            .post(format!("{}/agents/{runtime}/run", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .json(&serde_json::json!({"prompt":"FORCE_UPSTREAM_AUTH_ERROR","allowed_model":"test-model","timeout_secs":30}))
+            .send().await.unwrap().json().await.unwrap();
+        let rejected_id = rejected["run_id"].as_str().unwrap();
+        let events = collect_run_sse(&client, &daemon, rejected_id, None).await;
+        let failed: serde_json::Value = client
+            .get(format!("{}/runs/{rejected_id}", daemon.base_url))
+            .bearer_auth(&daemon.token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            failed["state"], "failed",
+            "{runtime} must not report API failure as success: {events:?}"
+        );
+    }
+    upstream_task.abort();
+}
+
 impl SpawnedDaemon {
     fn spawn(
         state_dir: &Path,
