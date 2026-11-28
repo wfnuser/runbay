@@ -4,6 +4,9 @@ use runbay_sandbox::SandboxRunOptions;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+mod anthropic;
+use anthropic::{AnthropicCliAdapter, CliKind};
+
 #[derive(Debug, Clone)]
 pub struct AdapterLaunchContext {
     pub prompt: String,
@@ -25,10 +28,22 @@ pub struct PreparedLaunch {
     pub secretless_gateway: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeOutcome {
+    Succeeded,
+    Failed(String),
+}
+
 pub trait RuntimeAdapter: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> AdapterCapabilities;
     fn prepare_launch(&self, ctx: &AdapterLaunchContext) -> Result<PreparedLaunch>;
+    fn output_outcome(&self, _event: &serde_json::Value) -> Option<NativeOutcome> {
+        None
+    }
+    fn requires_completion_event(&self) -> bool {
+        false
+    }
 }
 
 /// Real one-shot Codex CLI runtime adapter (`codex exec --json --ephemeral ...`).
@@ -299,6 +314,16 @@ impl AdapterRegistry {
         let mut adapters: BTreeMap<String, Box<dyn RuntimeAdapter>> = BTreeMap::new();
         let codex = CodexOneShotAdapter::discover(codex_bin);
         adapters.insert(codex.name().to_string(), Box::new(codex));
+        for (kind, override_var) in [
+            (CliKind::Claude, "RUNBAY_CLAUDE_BIN"),
+            (CliKind::Pi, "RUNBAY_PI_BIN"),
+        ] {
+            let adapter = AnthropicCliAdapter::discover(
+                kind,
+                std::env::var_os(override_var).map(PathBuf::from),
+            );
+            adapters.insert(adapter.name().into(), Box::new(adapter));
+        }
         if enable_fixture {
             let fixture = FixtureProtocolAdapter::new()?;
             adapters.insert(fixture.name().to_string(), Box::new(fixture));
@@ -315,5 +340,25 @@ impl AdapterRegistry {
             .iter()
             .map(|(k, v)| (k.clone(), v.capabilities()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_and_pi_are_advertised_as_one_shot_adapters() {
+        let registry = AdapterRegistry::build(false, None).unwrap();
+        for name in ["claude", "pi"] {
+            let adapter = registry
+                .get(name)
+                .expect("requested runtime must be registered");
+            let caps = adapter.capabilities();
+            assert_eq!(caps.runtime, name);
+            assert_eq!(caps.tier, crate::models::CapabilityTier::OneShot);
+            assert!(caps.supports_streaming && caps.supports_sandbox);
+            assert!(!caps.supports_hot_process && !caps.supports_native_resume);
+        }
     }
 }

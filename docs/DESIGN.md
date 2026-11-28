@@ -91,6 +91,14 @@ POST   /workspaces/:id/abort        discard speculative branch workspace
 
 ## 4. Runtime Adapters & Honest Capability Tiers
 
+Current execution implements the one-shot tier for Codex, Claude Code, and Pi.
+Claude/Pi use isolated invocation configuration and an Anthropic-compatible gateway;
+macOS supports their TCP transport, while Linux remains fail-closed. Native JSON
+completion outcomes supplement exit codes, including Pi errors that exit with zero.
+See the README for the tested CLI versions, tool restrictions, and setup.
+
+The richer session interface below is a future design, not the current Rust trait:
+
 Adapters advertise what they genuinely support instead of hiding protocol differences:
 
 ```rust
@@ -133,8 +141,8 @@ trait RuntimeAdapter {
 
 ### Secretless Loopback Model Gateway (`runbay-gateway`)
 - Binds `127.0.0.1:0` (and optional Unix domain sockets via `bind_unix_socket` for Linux `--unshare-net`) and injects real upstream API keys strictly on outbound hops; sandboxed processes receive only ephemeral 256-bit CSPRNG `rb_*` tokens.
-- Enforces an explicit route allowlist (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`), verifies unchanged trusted upstream origin, and enforces optional per-token `allowed_model` restrictions (`403 Forbidden`).
-- Passively parses SSE usage telemetry, detects tool names mid-stream to invoke prewarm callbacks (surfacing any callback errors explicitly), and wakes pending or stalled streams immediately upon token revocation via `tokio::sync::Notify`.
+- Enforces an explicit route allowlist (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/messages`), verifies unchanged trusted upstream origin, disables redirects, and enforces optional per-token `allowed_model` restrictions (`403 Forbidden`). Anthropic requests accept ephemeral Bearer or `x-api-key` authentication and replace credentials on the host-side upstream hop.
+- Passively parses OpenAI SSE usage telemetry and tool names to invoke prewarm callbacks (surfacing callback errors explicitly), and wakes pending or stalled streams immediately upon token revocation via `tokio::sync::Notify`. Anthropic forwarding preserves native events but does not yet populate protocol-specific gateway usage/prewarm metrics.
 
 ---
 
