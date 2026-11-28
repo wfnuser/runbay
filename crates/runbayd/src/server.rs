@@ -38,6 +38,28 @@ fn error_resp(status: StatusCode, code: &str, message: impl Into<String>) -> Box
     )
 }
 
+/// Error response carrying a `Retry-After` header (P3b admission rejects,
+/// design §4.1 C revision).
+fn error_resp_retry_after(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    retry_after_s: f64,
+) -> BoxedResponse {
+    let body = serde_json::json!({
+        "error": code,
+        "message": message.into(),
+        "retry_after_s": retry_after_s
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .header("retry-after", format!("{}", retry_after_s.ceil() as u64))
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
+        .unwrap()
+}
+
 fn format_sse_frame(ev: &RunEvent) -> Bytes {
     let data = serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string());
     Bytes::from(format!(
@@ -129,6 +151,19 @@ fn map_domain_error(err: anyhow::Error) -> BoxedResponse {
         error_resp(StatusCode::FORBIDDEN, "workspace_forbidden", msg)
     } else if msg.starts_with("QUEUE_FULL:") {
         error_resp(StatusCode::TOO_MANY_REQUESTS, "queue_full", msg)
+    } else if msg.starts_with("ADMISSION_REJECTED:") {
+        // P3b three-state admission reject (design §4.1): 429 + retry-after.
+        let retry_after_s = msg
+            .split("retry_after_s=")
+            .nth(1)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(2.0);
+        error_resp_retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            "admission_rejected",
+            msg,
+            retry_after_s,
+        )
     } else if msg.starts_with("PAYLOAD_TOO_LARGE:") {
         error_resp(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", msg)
     } else if msg.starts_with("UNKNOWN_RUNTIME:")
@@ -182,6 +217,41 @@ async fn handle_http_request(sup: Arc<DaemonSupervisor>, req: Request<Incoming>)
                 e.to_string(),
             ),
         };
+    }
+
+    // GET /metrics — P3c global scheduler aggregates (§4.6: no per-tenant
+    // breakdown, which would be a timing side-channel).
+    if method == Method::GET && path == "/metrics" {
+        return json_resp(StatusCode::OK, sup.scheduler_metrics());
+    }
+
+    // GET/POST /v1/scheduler/mode — P3b one-switch Shadow/Active fallback
+    // (design §7 "一键可回退 Shadow"). In-flight runs are unaffected.
+    if path == "/v1/scheduler/mode" {
+        if method == Method::GET {
+            return json_resp(
+                StatusCode::OK,
+                serde_json::json!({"mode": sup.scheduler_mode().as_str()}),
+            );
+        }
+        if method == Method::POST {
+            let payload: serde_json::Value = match read_json_body(req).await {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            let mode_str = payload.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            return match crate::supervisor::SchedulerMode::parse(mode_str) {
+                Some(m) => {
+                    sup.set_scheduler_mode(m);
+                    json_resp(StatusCode::OK, serde_json::json!({"mode": m.as_str()}))
+                }
+                None => error_resp(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("mode must be 'shadow' or 'active', got '{mode_str}'"),
+                ),
+            };
+        }
     }
 
     // POST /agents

@@ -61,6 +61,9 @@ pub struct AgentStatusView {
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     Queued,
+    /// P3b: admitted to the DeferPool with a deadline (design §4.5). Terminal
+    /// semantics unchanged — a deferred run can still be cancelled or fail.
+    Deferred,
     Running,
     Succeeded,
     Failed,
@@ -71,6 +74,7 @@ impl RunState {
     pub fn as_str(&self) -> &'static str {
         match self {
             RunState::Queued => "queued",
+            RunState::Deferred => "deferred",
             RunState::Running => "running",
             RunState::Succeeded => "succeeded",
             RunState::Failed => "failed",
@@ -81,6 +85,7 @@ impl RunState {
     pub fn from_db(value: &str) -> Self {
         match value {
             "queued" => RunState::Queued,
+            "deferred" => RunState::Deferred,
             "running" => RunState::Running,
             "succeeded" => RunState::Succeeded,
             "cancelled" => RunState::Cancelled,
@@ -111,6 +116,17 @@ pub struct SubmitRunRequest {
     pub allowed_model: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<String>,
+    /// Optional cache-cluster id (Space/doc prefix group). Fingerprinted from
+    /// the prompt head when absent (P3 cache ledger, design §3.1).
+    #[serde(default)]
+    pub cluster_id: Option<String>,
+    /// Optional tenant id; defaults to the agent id (isolation boundary).
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// Explicit SLO budget for this run (seconds). Falls back to the
+    /// per-priority default in the scheduler config when absent (design §4.1).
+    #[serde(default)]
+    pub deadline_budget_s: Option<f64>,
 }
 
 fn default_priority() -> String {

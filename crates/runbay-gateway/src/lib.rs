@@ -66,6 +66,8 @@ impl TokenMeta {
     }
 }
 
+type RecordListener = Arc<dyn Fn(&GatewayCallRecord) + Send + Sync>;
+
 struct GatewayInner {
     upstream_base_url: reqwest::Url,
     real_api_key: String,
@@ -73,8 +75,22 @@ struct GatewayInner {
     on_specbox_tool: Option<SpecboxCallback>,
     tokens: Mutex<HashMap<String, TokenMeta>>,
     records: Mutex<Vec<GatewayCallRecord>>,
+    /// Optional synchronous listener fired on every pushed record
+    /// (P3a TelemetryBridge: feed the scheduler's cache ledger in real time).
+    record_listener: Mutex<Option<RecordListener>>,
     unauthorized_attempts: AtomicU64,
     next_call_id: AtomicU64,
+}
+
+impl GatewayInner {
+    /// Single choke point for call records: store + notify the listener.
+    fn push_record(&self, rec: GatewayCallRecord) {
+        let listener = self.record_listener.lock().clone();
+        if let Some(l) = listener {
+            l(&rec);
+        }
+        self.records.lock().push(rec);
+    }
 }
 
 /// Strictly map incoming gateway routes to canonical upstream subpaths.
@@ -149,6 +165,7 @@ impl SecretlessLoopbackGateway {
             on_specbox_tool,
             tokens: Mutex::new(HashMap::new()),
             records: Mutex::new(Vec::new()),
+            record_listener: Mutex::new(None),
             unauthorized_attempts: AtomicU64::new(0),
             next_call_id: AtomicU64::new(1),
         });
@@ -270,6 +287,12 @@ impl SecretlessLoopbackGateway {
         if let Some(meta) = self.inner.tokens.lock().get(token) {
             meta.revoke();
         }
+    }
+
+    /// Register a synchronous listener fired on every gateway call record
+    /// (used by runbayd's TelemetryBridge to maintain the cache ledger).
+    pub fn set_record_listener(&self, f: impl Fn(&GatewayCallRecord) + Send + Sync + 'static) {
+        *self.inner.record_listener.lock() = Some(Arc::new(f));
     }
 
     pub fn stats(&self) -> GatewayStats {
@@ -492,7 +515,7 @@ async fn handle_request(
             meta.cancel_notify.notified().await;
         } => {
             let total_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
-            state.records.lock().push(GatewayCallRecord {
+            state.push_record(GatewayCallRecord {
                 call_id,
                 run_token_prefix: token_prefix,
                 model,
@@ -517,7 +540,7 @@ async fn handle_request(
             Ok(r) => r,
             Err(e) => {
                 let total_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
-                state.records.lock().push(GatewayCallRecord {
+                state.push_record(GatewayCallRecord {
                     call_id,
                     run_token_prefix: token_prefix,
                     model,
@@ -554,7 +577,7 @@ async fn handle_request(
                 meta.cancel_notify.notified().await;
             } => {
                 let total_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
-                state.records.lock().push(GatewayCallRecord {
+                state.push_record(GatewayCallRecord {
                     call_id,
                     run_token_prefix: token_prefix,
                     model,
@@ -579,7 +602,7 @@ async fn handle_request(
         };
         let total_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
         let (pt, ct, cmp) = extract_usage_from_json(&resp_bytes);
-        state.records.lock().push(GatewayCallRecord {
+        state.push_record(GatewayCallRecord {
             call_id,
             run_token_prefix: token_prefix,
             model,
@@ -654,12 +677,9 @@ async fn handle_request(
                                 {
                                     completion_tokens = v;
                                 }
-                                if let Some(v) = u
-                                    .get("prompt_tokens_details")
-                                    .and_then(|d| d.get("cached_tokens"))
-                                    .and_then(|x| x.as_u64())
-                                {
-                                    cached_tokens = v;
+                                let ct = cached_tokens_from_usage(u);
+                                if ct > 0 {
+                                    cached_tokens = ct;
                                 }
                             }
                             if spec_tool.is_none() {
@@ -706,7 +726,7 @@ async fn handle_request(
         };
 
         let total_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
-        stream_state.records.lock().push(GatewayCallRecord {
+        stream_state.push_record(GatewayCallRecord {
             call_id,
             run_token_prefix: token_prefix,
             model,
@@ -736,6 +756,22 @@ async fn handle_request(
         .unwrap()
 }
 
+/// Cached-prompt token count across provider dialects: OpenAI-compatible
+/// `usage.prompt_tokens_details.cached_tokens`, DeepSeek
+/// `usage.prompt_cache_hit_tokens` (L2 semi-real reconciliation).
+fn cached_tokens_from_usage(u: &serde_json::Value) -> u64 {
+    if let Some(v) = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        return v;
+    }
+    u.get("prompt_cache_hit_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
 fn extract_usage_from_json(bytes: &[u8]) -> (u64, u64, u64) {
     let Ok(j) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return (0, 0, 0);
@@ -748,11 +784,7 @@ fn extract_usage_from_json(bytes: &[u8]) -> (u64, u64, u64) {
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let ct = u
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let ct = cached_tokens_from_usage(u);
     (pt, ct, cmp)
 }
 
@@ -1065,6 +1097,34 @@ mod tests {
         assert_eq!(ok.origin(), origin_only.origin());
     }
 
+    #[test]
+    fn test_cached_tokens_from_usage_openai_and_deepseek_dialects() {
+        // OpenAI-compatible dialect.
+        let openai = serde_json::json!({
+            "usage": {"prompt_tokens": 4000, "completion_tokens": 8,
+                      "prompt_tokens_details": {"cached_tokens": 3800}}
+        });
+        assert_eq!(
+            extract_usage_from_json(openai.to_string().as_bytes()),
+            (4000, 3800, 8)
+        );
+        // DeepSeek dialect: no prompt_tokens_details, hit count is a top-level field.
+        let deepseek = serde_json::json!({
+            "usage": {"prompt_tokens": 4000, "completion_tokens": 8,
+                      "prompt_cache_hit_tokens": 3800, "prompt_cache_miss_tokens": 200}
+        });
+        assert_eq!(
+            extract_usage_from_json(deepseek.to_string().as_bytes()),
+            (4000, 3800, 8)
+        );
+        // Cold call (no cache fields at all) -> zero cached tokens.
+        let cold = serde_json::json!({"usage": {"prompt_tokens": 100, "completion_tokens": 4}});
+        assert_eq!(
+            extract_usage_from_json(cold.to_string().as_bytes()),
+            (100, 0, 4)
+        );
+    }
+
     #[tokio::test]
     async fn test_tokens_are_unique_csprng_and_model_scope_enforced() {
         let mock = MockUpstreamServer::start().await.unwrap();
@@ -1252,6 +1312,8 @@ mod tests {
         assert!(stats.calls[0].specbox_prewarm_ms.is_none());
     }
 
+    // OS sandbox e2e only makes sense on unix (Seatbelt/bwrap + UDS bridge).
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_os_sandbox_to_rust_secretless_gateway_e2e() {
         let mock = MockUpstreamServer::start().await.unwrap();

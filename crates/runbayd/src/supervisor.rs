@@ -3,9 +3,13 @@ use crate::auth::{
     generate_csprng_token, validate_identifier, validate_workspace_dir, MAX_PROMPT_BYTES,
     MAX_TIMEOUT_SECS,
 };
+use crate::dispatcher::{DispatchEntry, DispatchQueue, DispatchTicket, SlotGuard};
 use crate::models::{
     AgentRecord, AgentStatusView, CapabilityTier, DaemonStatusResponse, RegisterAgentRequest,
     RunEvent, RunRecord, RunState, SubmitRunRequest,
+};
+use crate::runtime_pool::{
+    cluster_key, QueueDepth, RuntimePoolScheduler, ShadowConfig, SubmitMeta,
 };
 use crate::store::DaemonStore;
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,14 +25,40 @@ use std::collections::HashMap;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{broadcast, Notify, Semaphore};
+use tokio::sync::{broadcast, oneshot, Notify, Semaphore};
 
 const MAX_EVENT_LINE_BYTES: usize = 8192;
 const BROADCAST_CAPACITY: usize = 256;
+
+/// P3b scheduler mode (design §7): `Shadow` logs decisions only (P3a
+/// behavior); `Active` enforces three-state admission + dispatcher ordering.
+/// Flippable at runtime — one-switch fallback to Shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerMode {
+    Shadow,
+    Active,
+}
+
+impl SchedulerMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SchedulerMode::Shadow => "shadow",
+            SchedulerMode::Active => "active",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "shadow" => Some(SchedulerMode::Shadow),
+            "active" => Some(SchedulerMode::Active),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -45,6 +75,13 @@ pub struct DaemonConfig {
     pub upstream_api_key: Option<String>,
     pub enable_fixture_adapter: bool,
     pub codex_bin: Option<PathBuf>,
+    /// P3b: shadow (log-only) or active (enforced) admission control.
+    pub scheduler_mode: SchedulerMode,
+    /// P3b guardrail knobs (design §4.2 / §6).
+    pub n_reserved_bg_workers: usize,
+    /// Rescue floor in estimated prompt tokens (bytes/4). CLI-overridable so
+    /// P4 can recalibrate against cowiki's real prompt-length distribution.
+    pub min_rescue_prefix_tokens: usize,
 }
 
 struct ActiveRunEntry {
@@ -102,6 +139,13 @@ pub struct DaemonSupervisor {
     queued_runs: Arc<AtomicUsize>,
     running_runs: Arc<AtomicUsize>,
     shutdown_notify: Arc<Notify>,
+    /// P3a shadow admission controller + telemetry bridge (design v1.1).
+    pub runtime_pool: Arc<RuntimePoolScheduler>,
+    /// P3b unified arbitration queue + slot ring (design §3/§4.5).
+    dispatch: Arc<Mutex<DispatchQueue>>,
+    dispatch_notify: Arc<Notify>,
+    /// 0 = shadow, 1 = active (runtime-flippable, one-switch fallback).
+    scheduler_mode: AtomicU8,
 }
 
 impl DaemonSupervisor {
@@ -131,12 +175,25 @@ impl DaemonSupervisor {
             *parent = fs::canonicalize(&*parent)?;
             validate_cgroup_parent(parent)?;
         }
-        store.recover_interrupted_runs(|id| {
+        let recovered = store.recover_interrupted_runs(|id| {
             if let Some(parent) = &cfg.cgroup_root {
                 clean_interrupted_cgroup(parent, id)?;
             }
             Ok(())
         })?;
+
+        // P3b: scheduler pool config derived from daemon config (design §6).
+        let pool_cfg = ShadowConfig {
+            max_concurrent_runs: cfg.max_concurrent_runs.max(1),
+            combined_queue_cap: cfg.max_queued_runs.max(1),
+            n_reserved_bg_workers: cfg.n_reserved_bg_workers,
+            min_rescue_prefix_tokens: cfg.min_rescue_prefix_tokens,
+            ..Default::default()
+        };
+        let runtime_pool = RuntimePoolScheduler::open(&state_dir, pool_cfg)?;
+        // L6: backfill `actual` rows for runs interrupted by the previous
+        // shutdown so the decision ledger has no orphan decisions.
+        runtime_pool.backfill_restart_actuals(&recovered);
 
         let adapters = AdapterRegistry::build(cfg.enable_fixture_adapter, cfg.codex_bin.clone())?;
 
@@ -161,8 +218,29 @@ impl DaemonSupervisor {
                 (None, None)
             };
 
+        // P3a telemetry bridge: gateway call records feed the cache ledger live.
+        if let Some(gw) = &gateway {
+            let pool = Arc::clone(&runtime_pool);
+            gw.set_record_listener(move |rec| {
+                let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+                pool.on_gateway_call(
+                    &rec.run_token_prefix,
+                    rec.prompt_tokens,
+                    rec.cached_tokens,
+                    rec.total_ms,
+                    rec.aborted,
+                    now,
+                );
+            });
+        }
+
         let max_conc = cfg.max_concurrent_runs.max(1);
-        Ok(Arc::new(Self {
+        let n_reserved_bg = cfg.n_reserved_bg_workers;
+        let mode_init = match cfg.scheduler_mode {
+            SchedulerMode::Shadow => 0u8,
+            SchedulerMode::Active => 1u8,
+        };
+        let sup = Arc::new(Self {
             _state_lock: state_lock,
             config: cfg,
             store,
@@ -176,7 +254,41 @@ impl DaemonSupervisor {
             queued_runs: Arc::new(AtomicUsize::new(0)),
             running_runs: Arc::new(AtomicUsize::new(0)),
             shutdown_notify: Arc::new(Notify::new()),
-        }))
+            runtime_pool,
+            dispatch: Arc::new(Mutex::new(DispatchQueue::new(max_conc, n_reserved_bg))),
+            dispatch_notify: Arc::new(Notify::new()),
+            scheduler_mode: AtomicU8::new(mode_init),
+        });
+        // P3b dispatcher loop: ordering + defer escalation + AIMD ticks.
+        {
+            let s = Arc::clone(&sup);
+            tokio::spawn(async move {
+                s.dispatch_loop().await;
+            });
+        }
+        Ok(sup)
+    }
+
+    /// Current scheduler mode (shadow = log-only, active = enforced).
+    pub fn scheduler_mode(&self) -> SchedulerMode {
+        if self.scheduler_mode.load(Ordering::SeqCst) == 1 {
+            SchedulerMode::Active
+        } else {
+            SchedulerMode::Shadow
+        }
+    }
+
+    /// Runtime switch (design §7: one-click fallback to Shadow). In-flight
+    /// runs are unaffected; only new submits and dispatcher ordering change.
+    pub fn set_scheduler_mode(&self, mode: SchedulerMode) {
+        self.scheduler_mode.store(
+            match mode {
+                SchedulerMode::Shadow => 0,
+                SchedulerMode::Active => 1,
+            },
+            Ordering::SeqCst,
+        );
+        self.dispatch_notify.notify_one();
     }
 
     pub fn status(&self) -> Result<DaemonStatusResponse> {
@@ -209,6 +321,28 @@ impl DaemonSupervisor {
             ],
             adapters: self.adapters.capabilities_map(),
             restart_semantics: "Durable agent registry and run history persist in SQLite; running child processes do not survive daemon restarts and are marked failed (daemon_restarted) on startup.".to_string(),
+        })
+    }
+
+    /// P3c `/metrics` payload: global scheduler aggregates (§4.6 — no
+    /// per-tenant breakdown, which would be a timing side-channel). Combines
+    /// the live dispatch queue depth with the `RuntimePoolScheduler` snapshot
+    /// (AIMD / rescue / defer / cache / guardrail).
+    pub fn scheduler_metrics(&self) -> serde_json::Value {
+        let (queued, deferred, total) = {
+            let q = self.dispatch.lock();
+            (q.queued_count(), q.deferred_count(), q.len())
+        };
+        let pool = self.runtime_pool.metrics();
+        serde_json::json!({
+            "scheduler": { "mode": self.scheduler_mode().as_str() },
+            "queue": {
+                "in_flight": self.running_runs.load(Ordering::SeqCst),
+                "queued": queued,
+                "deferred": deferred,
+                "total": total,
+            },
+            "pool": pool,
         })
     }
 
@@ -446,12 +580,70 @@ impl DaemonSupervisor {
         }
 
         let run_id = format!("run_{}", &generate_csprng_token("")[..20]);
+
+        // P3b admission: three-state decision (always logged; enforced only in
+        // Active mode — Shadow keeps P3a log-only semantics).
+        let meta = SubmitMeta {
+            run_id: run_id.clone(),
+            cluster_id: cluster_key(req.cluster_id.as_deref(), &req.prompt),
+            tenant: req
+                .tenant_id
+                .clone()
+                .unwrap_or_else(|| agent.agent_id.clone()),
+            rev: workspace_rev,
+            priority: req.priority.clone(),
+            prompt_tokens_est: req.prompt.len() / 4, // bytes/4 heuristic (no tokenizer at submit; calibrate in live validation, L3)
+            submitted_at: Utc::now().timestamp_millis() as f64 / 1000.0,
+            deadline_budget_s: req.deadline_budget_s,
+            // Placeholder — `register_submit` recomputes this from the live
+            // rescue-window predicate before the meta is stored.
+            rescuable: false,
+        };
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+        let depth = {
+            let q = self.dispatch.lock();
+            QueueDepth {
+                in_flight: self.running_runs.load(Ordering::SeqCst),
+                queued: q.queued_count(),
+                deferred: q.deferred_count(),
+            }
+        };
+        let active_mode = self.scheduler_mode() == SchedulerMode::Active;
+        let cap = if active_mode {
+            self.runtime_pool.aimd_cap()
+        } else {
+            self.config.max_concurrent_runs as f64
+        };
+        let decision = self
+            .runtime_pool
+            .register_submit(meta.clone(), depth, cap, now);
+
+        if active_mode && decision.decision == "reject" {
+            drop(queue_guard);
+            let retry_after = crate::runtime_pool::retry_after_s(
+                &run_id,
+                decision.reason,
+                decision.est_wait_pred,
+                self.runtime_pool.config().aimd_period_s,
+            );
+            bail!(
+                "ADMISSION_REJECTED: reason={} retry_after_s={:.1}",
+                decision.reason,
+                retry_after
+            );
+        }
+
+        let is_deferred = active_mode && decision.decision == "defer";
         let record = RunRecord {
             run_id: run_id.clone(),
             agent_id: agent.agent_id.clone(),
             runtime: agent.runtime.clone(),
             prompt: req.prompt.clone(),
-            state: RunState::Queued,
+            state: if is_deferred {
+                RunState::Deferred
+            } else {
+                RunState::Queued
+            },
             priority: req.priority.clone(),
             capability_tier: CapabilityTier::OneShot,
             workspace_rev,
@@ -484,17 +676,52 @@ impl DaemonSupervisor {
             .lock()
             .insert(run_id.clone(), Arc::clone(&active));
 
-        self.emit_lifecycle_event(
-            &active,
-            &run_id,
-            &agent.agent_id,
-            "run.queued",
-            serde_json::json!({
-                "state": "queued",
-                "runtime": agent.runtime,
-                "workspace_rev": workspace_rev
-            }),
-        );
+        // P3c: defer emits a dedicated `run.deferred` lifecycle event (design
+        // §4.5) carrying the deadline + reason, so the submitter can observe
+        // the three-state decision. Admitted runs keep `run.queued`.
+        let lifecycle = if is_deferred {
+            (
+                "run.deferred",
+                serde_json::json!({
+                    "state": "deferred",
+                    "runtime": agent.runtime,
+                    "workspace_rev": workspace_rev,
+                    "reason": decision.reason,
+                    "defer_until": decision.defer_until,
+                    "est_wait_pred": decision.est_wait_pred,
+                }),
+            )
+        } else {
+            (
+                "run.queued",
+                serde_json::json!({
+                    "state": record.state.as_str(),
+                    "runtime": agent.runtime,
+                    "workspace_rev": workspace_rev
+                }),
+            )
+        };
+        self.emit_lifecycle_event(&active, &run_id, &agent.agent_id, lifecycle.0, lifecycle.1);
+
+        // Enter the unified arbitration queue (P3b). Defer entries carry the
+        // deadline from the admission decision (design §4.1).
+        let (ticket_tx, ticket_rx) = oneshot::channel::<DispatchTicket>();
+        {
+            let mut q = self.dispatch.lock();
+            q.push(DispatchEntry {
+                meta,
+                enqueued_at: now,
+                defer_until: if is_deferred {
+                    decision.defer_until
+                } else {
+                    None
+                },
+                escalated: false,
+                from_defer: is_deferred,
+                ticket: ticket_tx,
+            });
+        }
+        self.dispatch_notify.notify_one();
 
         let sup = Arc::clone(self);
         let run_clone = record.clone();
@@ -508,6 +735,7 @@ impl DaemonSupervisor {
                 timeout_secs,
                 active_clone,
                 queue_guard,
+                ticket_rx,
             )
             .await;
         });
@@ -623,14 +851,17 @@ impl DaemonSupervisor {
         timeout_secs: u64,
         active: Arc<ActiveRunEntry>,
         mut queue_guard: QueueCounterGuard,
+        ticket_rx: oneshot::Receiver<DispatchTicket>,
     ) {
         let sink = Arc::new(GuardedRunSink::new(active.cancel_token.clone()));
 
-        // 1. Wait for concurrency permit (or abort cleanly if cancelled while queued)
-        let permit = tokio::select! {
+        // 1. Wait for the dispatcher ticket (or abort cleanly if cancelled
+        //    while queued). The ticket carries the concurrency permit + slot.
+        let ticket = tokio::select! {
             biased;
             _ = active.cancel_notify.notified() => {
                 queue_guard.release();
+                self.dispatch.lock().remove(&run.run_id);
                 self.finalize_run(
                     &mut run,
                     &active,
@@ -644,6 +875,7 @@ impl DaemonSupervisor {
             }
             _ = self.shutdown_notify.notified() => {
                 queue_guard.release();
+                self.dispatch.lock().remove(&run.run_id);
                 self.finalize_run(
                     &mut run,
                     &active,
@@ -655,10 +887,10 @@ impl DaemonSupervisor {
                 );
                 return;
             }
-            acquired = self.run_semaphore.clone().acquire_owned() => {
+            dispatched = ticket_rx => {
                 queue_guard.release();
-                match acquired {
-                    Ok(p) => p,
+                match dispatched {
+                    Ok(t) => t,
                     Err(_) => {
                         self.finalize_run(
                             &mut run,
@@ -667,13 +899,16 @@ impl DaemonSupervisor {
                             RunState::Failed,
                             None,
                             Some("scheduler_closed"),
-                            Some("Live run queue semaphore closed"),
+                            Some("Dispatch queue closed"),
                         );
                         return;
                     }
                 }
             }
         };
+        let permit = ticket.permit;
+        // Any early return from here on frees the slot (affinity memory kept).
+        let _slot_guard = SlotGuard::new(Arc::clone(&self.dispatch), ticket.slot_id);
 
         if active.cancel_token.is_cancelled() {
             drop(permit);
@@ -755,6 +990,7 @@ impl DaemonSupervisor {
         // 3. Mint ephemeral gateway token (RAII-revoked on exit/cancel/timeout).
         let gw_guard = self.gateway.as_ref().map(|gw| {
             let tok = gw.mint_run_token(&run.run_id, req.allowed_model.clone());
+            self.runtime_pool.register_run_token(&tok, &run.run_id);
             GatewayTokenGuard {
                 gateway: Arc::clone(gw),
                 token: tok,
@@ -1068,6 +1304,113 @@ impl DaemonSupervisor {
         );
     }
 
+    /// P3b dispatcher loop (design §3): on slot release, score the unified
+    /// arbitration queue and hand out tickets. Also escalates expired defer
+    /// entries and drives AIMD control ticks (§4.4).
+    async fn dispatch_loop(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = self.shutdown_notify.notified() => break,
+                _ = self.dispatch_notify.notified() => {}
+                _ = tick.tick() => {}
+            }
+            self.drain_dispatch();
+        }
+    }
+
+    /// One dispatch drain: AIMD tick → defer escalation → fill free slots.
+    fn drain_dispatch(&self) {
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+
+        let active_mode = self.scheduler_mode() == SchedulerMode::Active;
+
+        // AIMD: queue-depth sample + control tick (§4.4) — active only. In
+        // shadow mode the controller stays frozen at max_cap so "shadow"
+        // truly records without intervening; switching to Active starts from
+        // a clean max_cap gate.
+        if active_mode {
+            let depth_total = self.dispatch.lock().len();
+            self.runtime_pool.note_queue_depth(depth_total as f64, now);
+            self.runtime_pool.aimd_tick(now);
+        }
+
+        // Defer expiry → forced tier (unified arbitration with ceiling, B3).
+        let escalated = self.dispatch.lock().escalate_due(now);
+        for rid in &escalated {
+            if let Ok(Some(mut rec)) = self.store.get_run(rid) {
+                if rec.state == RunState::Deferred {
+                    rec.state = RunState::Queued;
+                    let _ = self.store.update_run(&rec);
+                }
+            }
+        }
+
+        // Fill free slots while permits are available.
+        loop {
+            // Take a slot first so slot ring and semaphore stay in lockstep.
+            let slot_id = {
+                let mut q = self.dispatch.lock();
+                if q.is_empty() {
+                    return;
+                }
+                match q.pop_free_slot() {
+                    Some(s) => s,
+                    None => return,
+                }
+            };
+            let Ok(permit) = self.run_semaphore.clone().try_acquire_owned() else {
+                self.dispatch.lock().release(slot_id);
+                return;
+            };
+            let (entry, reason, score) = {
+                let mut q = self.dispatch.lock();
+                let cands = q.candidates();
+                if cands.is_empty() {
+                    q.release(slot_id);
+                    drop(permit);
+                    return;
+                }
+                let slot_ctx = q.slot_ctx(slot_id);
+                let reserved_slot = q.slot_reserved_bg(slot_id);
+                let picked = if active_mode {
+                    self.runtime_pool
+                        .pick_best(&cands, now, Some(&slot_ctx), reserved_slot)
+                } else {
+                    // Shadow fallback: FIFO (oldest first), no guardrails.
+                    Some((0, "normal", 0.0))
+                };
+                let Some((idx, reason, score)) = picked else {
+                    q.release(slot_id);
+                    drop(permit);
+                    return;
+                };
+                let entry = q.take(idx);
+                q.assign(slot_id, &entry);
+                (entry, reason, score)
+            };
+
+            // Dispatch-time ledger row (`kind:"dispatch"`; joins stay 1:1).
+            self.runtime_pool.log_dispatch(
+                &entry.meta,
+                if entry.escalated { "forced" } else { "admit" },
+                reason,
+                score,
+                now,
+            );
+
+            if entry
+                .ticket
+                .send(DispatchTicket { permit, slot_id })
+                .is_err()
+            {
+                // Receiver gone (cancelled while queued): free the slot.
+                self.dispatch.lock().release(slot_id);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finalize_run(
         &self,
@@ -1086,6 +1429,20 @@ impl DaemonSupervisor {
         run.late_events_rejected = sink.rejected_late_count() as u64;
         run.finished_at = Some(Utc::now().to_rfc3339());
         let _ = self.store.update_run(run);
+
+        // P3a shadow ledger: run-outcome actuals + termination attribution.
+        let started_unix = run.started_at.as_deref().and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+        });
+        self.runtime_pool.finalize_run(
+            &run.run_id,
+            started_unix,
+            state.as_str(),
+            error_code,
+            Utc::now().timestamp_millis() as f64 / 1000.0,
+        );
 
         let ev_type = match state {
             RunState::Succeeded => "run.succeeded",
